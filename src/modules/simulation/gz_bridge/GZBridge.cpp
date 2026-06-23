@@ -293,6 +293,14 @@ bool GZBridge::subscribeDistanceSensor(bool required)
         return required ? false : true;
     }
 
+    std::string lidar_front_sensor = "/world/" + _world_name + "/model/" + _model_name +
+                     "/link/lidar_front_sensor_link/sensor/lidar_front/scan";
+
+    if (!_node.Subscribe(lidar_front_sensor, &GZBridge::laserScantoFrontLidarSensorCallback, this)) {
+        PX4_WARN("failed to subscribe to %s", lidar_front_sensor.c_str());
+        return required ? false : true;
+    }
+
     return true;
 }
 
@@ -3074,12 +3082,23 @@ void GZBridge::navSatCallback(const gz::msgs::NavSat &msg)
 // Publica sensor de distancia e aplica offsets de ataque de LiDAR ou sonar.
 void GZBridge::laserScantoLidarSensorCallback(const gz::msgs::LaserScan &msg)
 {
+    publishDistanceSensor(msg, _distance_sensor_pub, 1);
+}
+
+void GZBridge::laserScantoFrontLidarSensorCallback(const gz::msgs::LaserScan &msg)
+{
+    publishDistanceSensor(msg, _distance_sensor_front_pub, 2);
+}
+
+void GZBridge::publishDistanceSensor(const gz::msgs::LaserScan &msg, uORB::PublicationMulti<distance_sensor_s> &pub,
+                     uint8_t device_address)
+{
 
     device::Device::DeviceId id{};
     id.devid_s.bus_type = device::Device::DeviceBusType::DeviceBusType_SIMULATION;
     id.devid_s.devtype = DRV_DIST_DEVTYPE_SIM;
     id.devid_s.bus = 1;
-    id.devid_s.address = 1;
+    id.devid_s.address = device_address;
 
     distance_sensor_s report{};
     report.timestamp = hrt_absolute_time();
@@ -3147,7 +3166,7 @@ void GZBridge::laserScantoLidarSensorCallback(const gz::msgs::LaserScan &msg)
         _ground_distance_timestamp = report.timestamp;
     }
 
-    _distance_sensor_pub.publish(report);
+    pub.publish(report);
 }
 
 // Converte o LaserScan 2D em setores de distancia para prevencao de colisao.

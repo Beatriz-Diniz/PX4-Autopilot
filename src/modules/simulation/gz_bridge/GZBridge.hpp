@@ -151,6 +151,9 @@ private:
     void odometryCallback(const gz::msgs::OdometryWithCovariance &msg);
     void navSatCallback(const gz::msgs::NavSat &msg);
     void laserScantoLidarSensorCallback(const gz::msgs::LaserScan &msg);
+    void laserScantoFrontLidarSensorCallback(const gz::msgs::LaserScan &msg);
+    void publishDistanceSensor(const gz::msgs::LaserScan &msg, uORB::PublicationMulti<distance_sensor_s> &pub,
+                   uint8_t device_address);
     void laserScanCallback(const gz::msgs::LaserScan &msg);
     void opticalFlowCallback(const px4::msgs::OpticalFlow &msg);
     void magnetometerCallback(const gz::msgs::Magnetometer &msg);
@@ -173,7 +176,8 @@ private:
 
     uORB::SubscriptionInterval                    _parameter_update_sub{ORB_ID(parameter_update), 1_s};
 
-    uORB::Publication<distance_sensor_s>          _distance_sensor_pub{ORB_ID(distance_sensor)};
+    uORB::PublicationMulti<distance_sensor_s>     _distance_sensor_pub{ORB_ID(distance_sensor)};
+    uORB::PublicationMulti<distance_sensor_s>     _distance_sensor_front_pub{ORB_ID(distance_sensor)};
     uORB::Publication<differential_pressure_s>    _differential_pressure_pub{ORB_ID(differential_pressure)};
     uORB::Publication<obstacle_distance_s>        _obstacle_distance_pub{ORB_ID(obstacle_distance)};
     uORB::Publication<vehicle_angular_velocity_s> _angular_velocity_ground_truth_pub{ORB_ID(vehicle_angular_velocity_groundtruth)};
