@@ -293,14 +293,6 @@ bool GZBridge::subscribeDistanceSensor(bool required)
         return required ? false : true;
     }
 
-    std::string lidar_front_sensor = "/world/" + _world_name + "/model/" + _model_name +
-                     "/link/lidar_front_sensor_link/sensor/lidar_front/scan";
-
-    if (!_node.Subscribe(lidar_front_sensor, &GZBridge::laserScantoFrontLidarSensorCallback, this)) {
-        PX4_WARN("failed to subscribe to %s", lidar_front_sensor.c_str());
-        return required ? false : true;
-    }
-
     return true;
 }
 
@@ -1200,27 +1192,17 @@ void GZBridge::imuCallback(const gz::msgs::IMU &msg)
             ((timestamp - _vio_timestamp) <= BLACKOUT_VIO_TIMEOUT_US) &&
             PX4_ISFINITE(_vio_alt_msl);
 
-        const bool sim_agl_recent_for_alt =
-            _sim_agl_valid &&
-            (timestamp >= _sim_agl_timestamp) &&
-            ((timestamp - _sim_agl_timestamp) <= AUTO_LAND_GROUND_SENSOR_TIMEOUT_US) &&
-            PX4_ISFINITE(_sim_agl_m);
-
-        // A componente vertical da pseudo-GPS nao deve depender de DR.
-        // Quando VIO esta recente, usa a altitude VIO; caso contrario usa AGL como referencia de altura.
+        // A componente vertical usa VIO quando disponivel.
+        // Sem VIO recente, preserva a altitude propagada pelo dead reckoning.
         if (!_gps_auto_disarm_sent) {
-            double aux_alt_msl = NAN;
-            float aux_vel_d = 0.0f;
-            const char *aux_alt_src = nullptr;
+            double aux_alt_msl = _blackout_dr_alt;
+            float aux_vel_d = _blackout_dr_vel_d;
+            const char *aux_alt_src = "DR";
 
             if (vio_alt_recent) {
                 aux_alt_msl = _vio_alt_msl;
                 aux_vel_d = _vio_vel_d;
                 aux_alt_src = "VIO";
-            } else if (sim_agl_recent_for_alt) {
-                aux_alt_msl = static_cast<double>(_alt_ref) + _sim_agl_m;
-                aux_vel_d = 0.0f;
-                aux_alt_src = "AGL";
             }
 
             if (PX4_ISFINITE(aux_alt_msl)) {
@@ -1236,10 +1218,9 @@ void GZBridge::imuCallback(const gz::msgs::IMU &msg)
                 if ((timestamp - blackout_alt_sync_log_last_us) > 1000000ULL) {
                     blackout_alt_sync_log_last_us = timestamp;
 
-                    PX4_INFO("\n[Blackout-Mitig] Alt sync | src=%s | alt=%.2f | agl=%.2f | vio_alt=%.2f\n",
+                    PX4_INFO("\n[Blackout-Mitig] Alt sync | src=%s | alt=%.2f | vio_alt=%.2f\n",
                         aux_alt_src,
                         _blackout_dr_alt,
-                        sim_agl_recent_for_alt ? static_cast<double>(_sim_agl_m) : -1.0,
                         vio_alt_recent ? _vio_alt_msl : -1.0);
                 }
             }
@@ -1269,10 +1250,8 @@ void GZBridge::imuCallback(const gz::msgs::IMU &msg)
 
             float land_vel_d = 0.0f;
 
-            if (vio_alt_recent || sim_agl_recent_for_alt) {
-                const double aux_land_alt_msl = vio_alt_recent ?
-                    _vio_alt_msl :
-                    static_cast<double>(_alt_ref) + _sim_agl_m;
+            if (vio_alt_recent) {
+                const double aux_land_alt_msl = _vio_alt_msl;
 
                 if (PX4_ISFINITE(aux_land_alt_msl)) {
                     land_alt_msl = math::max(
@@ -1825,7 +1804,6 @@ void GZBridge::checkGpsAutoDisarm(uint64_t timestamp)
     }
 
     const bool ground_contact_by_sim_agl =
-        _gps_land_source_blackout &&
         sim_ground_recent &&
         (_sim_agl_m <= AUTO_LAND_SIM_GROUND_DISARM_AGL_M) &&
         (_sim_agl_ground_count >= SIM_AGL_GROUND_CONFIRM_COUNT);
@@ -1849,6 +1827,37 @@ void GZBridge::checkGpsAutoDisarm(uint64_t timestamp)
 
     const double disarm_pitch_deg = disarm_att_recent ?
         static_cast<double>(_sim_pitch_rad * 57.2957795f) : -999.0;
+
+    const float disarm_jmit_gs = sqrtf(
+        _jmit_pub_vel_n * _jmit_pub_vel_n +
+        _jmit_pub_vel_e * _jmit_pub_vel_e);
+
+    const bool forced_disarm_speed_ok =
+        (_lpos_ground_speed <= 0.15f) &&
+        (disarm_jmit_gs <= 0.10f);
+
+    const bool forced_disarm_att_ok =
+        !disarm_att_recent ||
+        ((fabsf(_sim_roll_rad) <= AUTO_LAND_MAX_ROLL_RAD) &&
+        (fabsf(_sim_pitch_rad) <= AUTO_LAND_MAX_PITCH_RAD));
+
+    if (force_disarm && (!forced_disarm_speed_ok || !forced_disarm_att_ok)) {
+        static uint64_t disarm_wait_log_last_us = 0;
+
+        if ((timestamp - disarm_wait_log_last_us) > AUTO_LAND_ATT_LOG_INTERVAL_US) {
+            disarm_wait_log_last_us = timestamp;
+
+            PX4_INFO("\n[GPS-Land] Waiting before forced disarm | agl=%.2f | dist=%.2f | lpos_gs=%.2f | jmit_gs=%.2f | roll=%.1f pitch=%.1f\n",
+                sim_ground_recent ? static_cast<double>(_sim_agl_m) : -1.0,
+                ground_sensor_recent ? static_cast<double>(_ground_distance_m) : -1.0,
+                static_cast<double>(_lpos_ground_speed),
+                static_cast<double>(disarm_jmit_gs),
+                disarm_roll_deg,
+                disarm_pitch_deg);
+        }
+
+        return;
+    }
 
     if (ground_contact_by_px4_landed) {
         PX4_WARN("\n[GPS-Land] PX4 landing detector confirmed landed | roll=%.1f pitch=%.1f - normal disarm\n",
@@ -2565,59 +2574,62 @@ void GZBridge::navSatCallback(const gz::msgs::NavSat &msg)
             // Se a mitigacao estiver ativa, medicoes anomalas sao rejeitadas.
             if (_attack_mitigation_enabled && gps_anomalous) {
 
-                // Na primeira deteccao, a ancora recebe a ultima estimativa confiavel do filtro.
+                const bool vio_recent_for_dr =
+                    _vio_valid &&
+                    (now >= _vio_timestamp) &&
+                    ((now - _vio_timestamp) <= BLACKOUT_VIO_TIMEOUT_US) &&
+                    PX4_ISFINITE(_vio_n_m) &&
+                    PX4_ISFINITE(_vio_e_m) &&
+                    PX4_ISFINITE(_vio_alt_msl);
+
+                const float dr_vel_n = vio_recent_for_dr ?
+                    math::constrain(_vio_vel_n, -JMIT_DR_VEL_MAX_M_S, JMIT_DR_VEL_MAX_M_S) : 0.0f;
+
+                const float dr_vel_e = vio_recent_for_dr ?
+                    math::constrain(_vio_vel_e, -JMIT_DR_VEL_MAX_M_S, JMIT_DR_VEL_MAX_M_S) : 0.0f;
+
+                const float dr_vel_d = vio_recent_for_dr ?
+                    math::constrain(_vio_vel_d, -JMIT_DR_VEL_Z_MAX_M_S, JMIT_DR_VEL_Z_MAX_M_S) : 0.0f;
+
                 if (_kf_attack_first) {
+                    _jmit_pub_n_m = vio_recent_for_dr ? _vio_n_m : (lpos_xy_recent ? _lpos_n_m : _kf_n_m);
+                    _jmit_pub_e_m = vio_recent_for_dr ? _vio_e_m : (lpos_xy_recent ? _lpos_e_m : _kf_e_m);
+                    _jmit_pub_alt = vio_recent_for_dr ? _vio_alt_msl : trusted_alt;
 
-                    _jmit_pub_n_m    = lpos_xy_recent ? _lpos_n_m : _kf_n_m;
-                    _jmit_pub_e_m    = lpos_xy_recent ? _lpos_e_m : _kf_e_m;
-                    _jmit_pub_alt    = trusted_alt;
-                    _jmit_pub_vel_n  = 0.0f;
-                    _jmit_pub_vel_e  = 0.0f;
-                    _jmit_pub_vel_d  = 0.0f;
+                    _jmit_pub_vel_n = dr_vel_n;
+                    _jmit_pub_vel_e = dr_vel_e;
+                    _jmit_pub_vel_d = dr_vel_d;
 
-                    _kf_n_m = _jmit_pub_n_m;
-                    _kf_e_m = _jmit_pub_e_m;
-                    _kf_alt = _jmit_pub_alt;
                     _kf_attack_first = false;
                 }
 
                 _kf_attack_dur_us += static_cast<uint64_t>(dt * 1e6);
 
-                // A ancora e propagada com VIO quando a odometria visual esta recente.
-                // Com odometria visual expirada, a mitigacao mantem a ancora atual.
+                if (vio_recent_for_dr) {
+                    _jmit_pub_n_m = _vio_n_m;
+                    _jmit_pub_e_m = _vio_e_m;
+                    _jmit_pub_alt = _vio_alt_msl;
 
-                const bool vio_recent_for_dr =
-                    _vio_valid &&
-                    (now >= _vio_timestamp) &&
-                    ((now - _vio_timestamp) <= BLACKOUT_VIO_TIMEOUT_US);
+                    _jmit_pub_vel_n = dr_vel_n;
+                    _jmit_pub_vel_e = dr_vel_e;
+                    _jmit_pub_vel_d = dr_vel_d;
 
-                const float dr_vel_n = vio_recent_for_dr ?
-                    math::constrain(_vio_vel_n, -JMIT_DR_VEL_MAX_M_S, JMIT_DR_VEL_MAX_M_S) : 0.0f;
-                const float dr_vel_e = vio_recent_for_dr ?
-                    math::constrain(_vio_vel_e, -JMIT_DR_VEL_MAX_M_S, JMIT_DR_VEL_MAX_M_S) : 0.0f;
+                } else {
+                    _jmit_pub_vel_n = 0.0f;
+                    _jmit_pub_vel_e = 0.0f;
+                    _jmit_pub_vel_d = 0.0f;
 
-                _jmit_pub_n_m += static_cast<double>(dr_vel_n) * dt;
-                _jmit_pub_e_m += static_cast<double>(dr_vel_e) * dt;
-                _jmit_pub_vel_n = dr_vel_n;
-                _jmit_pub_vel_e = dr_vel_e;
-
-                // During noise jamming, keep the pseudo-GPS altitude fixed at the
-                // last trusted filter altitude captured when the anomaly started.
-                // Do not follow local_position altitude or vertical dead-reckoning here,
-                // because both can drift downward after GPS innovations are rejected.
-                if (!PX4_ISFINITE(_jmit_pub_alt)) {
-                    _jmit_pub_alt = _kf_alt;
+                    if (!PX4_ISFINITE(_jmit_pub_alt)) {
+                        _jmit_pub_alt = _kf_alt;
+                    }
                 }
 
-                _jmit_pub_vel_d = 0.0f;
-
-                // O filtro interno passa a acompanhar a ancora para manter a predicao consistente.
                 _kf_n_m   = _jmit_pub_n_m;
                 _kf_e_m   = _jmit_pub_e_m;
                 _kf_alt   = _jmit_pub_alt;
-                _kf_vel_n = 0.0f;
-                _kf_vel_e = 0.0f;
-                _kf_vel_d = 0.0f;
+                _kf_vel_n = _jmit_pub_vel_n;
+                _kf_vel_e = _jmit_pub_vel_e;
+                _kf_vel_d = _jmit_pub_vel_d;
 
                 _kf_P_n   = JMIT_R_POS_CLEAN;
                 _kf_P_e   = JMIT_R_POS_CLEAN;
@@ -2635,11 +2647,11 @@ void GZBridge::navSatCallback(const gz::msgs::NavSat &msg)
                         NIS_n, NIS_e, NIS_alt,
                         _jmit_pub_n_m, _jmit_pub_e_m,
                         _jmit_pub_alt,
-                        "trusted-alt",
                         vio_recent_for_dr ? "VIO" : "HOLD",
-                        static_cast<double>(dr_vel_n),
-                        static_cast<double>(dr_vel_e),
-                        0.0);
+                        vio_recent_for_dr ? "VIO" : "HOLD",
+                        static_cast<double>(_jmit_pub_vel_n),
+                        static_cast<double>(_jmit_pub_vel_e),
+                        static_cast<double>(_jmit_pub_vel_d));
                 }
 
                 // Reprojecao da ancora local para latitude/longitude antes da publicacao GPS.
@@ -2653,9 +2665,9 @@ void GZBridge::navSatCallback(const gz::msgs::NavSat &msg)
                 altitude  = _jmit_pub_alt;
                 // Publica velocidade consistente com a propagacao da ancora.
                 // Com odometria visual expirada, publica velocidade zero para manter hold.
-                vel_north = dr_vel_n;
-                vel_east  = dr_vel_e;
-                vel_down  = 0.0f;
+                vel_north = _jmit_pub_vel_n;
+                vel_east  = _jmit_pub_vel_e;
+                vel_down  = _jmit_pub_vel_d;
 
             } else {
 
@@ -2759,47 +2771,65 @@ void GZBridge::navSatCallback(const gz::msgs::NavSat &msg)
     }
 
     if (_gps_landing_active) {
-        double land_alt_msl = _gps_land_start_alt_msl;
+        const bool land_att_recent =
+            _sim_att_valid &&
+            (timestamp >= _sim_att_timestamp) &&
+            ((timestamp - _sim_att_timestamp) <= 500000ULL);
+
+        const float land_abs_pitch_rad = land_att_recent ?
+            fabsf(_sim_pitch_rad) : 0.0f;
+
+        const float land_abs_roll_rad = land_att_recent ?
+            fabsf(_sim_roll_rad) : 0.0f;
+
+        const bool descent_attitude_ok =
+            !land_att_recent ||
+            ((land_abs_pitch_rad <= AUTO_LAND_MAX_PITCH_RAD) &&
+            (land_abs_roll_rad <= AUTO_LAND_MAX_ROLL_RAD));
+
+        double land_alt_msl = _gps_land_last_alt_valid ?
+            _gps_land_last_alt_msl : _gps_land_start_alt_msl;
+
         float land_vel_d = 0.0f;
 
-        if (_gps_land_source_blackout) {
-            const double land_elapsed_s = static_cast<double>(timestamp - _gps_land_hold_start_us) * 1e-6;
-            const double commanded_alt_msl = _gps_land_start_alt_msl -
-                (AUTO_LAND_DESCENT_RATE_M_S * land_elapsed_s);
+        const double target_alt_msl = _gps_land_source_blackout ?
+            _gps_land_target_alt_msl :
+            static_cast<double>(_alt_ref) + AUTO_LAND_TARGET_GPS_ANOMALY_AGL_M;
 
-            const bool target_reached = commanded_alt_msl <= _gps_land_target_alt_msl;
+        const double dt_land_s =
+            (_gps_land_last_update_us > 0 && timestamp >= _gps_land_last_update_us) ?
+            math::constrain(static_cast<double>(timestamp - _gps_land_last_update_us) * 1e-6, 0.0, 0.1) :
+            0.0;
 
-            land_alt_msl = target_reached ?
-                _gps_land_target_alt_msl : commanded_alt_msl;
+        _gps_land_last_update_us = timestamp;
 
-            land_vel_d = target_reached ?
+        if (descent_attitude_ok && !_gps_auto_disarm_sent) {
+            land_alt_msl = math::max(
+                target_alt_msl,
+                land_alt_msl - (AUTO_LAND_DESCENT_RATE_M_S * dt_land_s));
+
+            land_vel_d = (land_alt_msl <= target_alt_msl) ?
                 0.0f : static_cast<float>(AUTO_LAND_DESCENT_RATE_M_S);
+        }
 
-            if (_gps_auto_disarm_sent) {
-                land_alt_msl = _gps_land_target_alt_msl;
-                land_vel_d = 0.0f;
-            }
-        } else {
-            // Pouso por anomalia GPS: desce com taxa controlada para
-            // manter consistencia vertical entre a pseudo-GPS e as fontes de altitude.
+        if (_gps_auto_disarm_sent) {
+            land_alt_msl = target_alt_msl;
+            land_vel_d = 0.0f;
+        }
 
-            const double land_elapsed_s = static_cast<double>(timestamp - _gps_land_hold_start_us) * 1e-6;
-            const double commanded_alt_msl = _gps_land_start_alt_msl -
-                (AUTO_LAND_DESCENT_RATE_M_S * land_elapsed_s);
+        _gps_land_last_alt_msl = land_alt_msl;
+        _gps_land_last_alt_valid = true;
 
-            const double min_land_alt_msl = static_cast<double>(_alt_ref) + AUTO_LAND_TARGET_GPS_ANOMALY_AGL_M;
-            const bool target_reached = commanded_alt_msl <= min_land_alt_msl;
+        static uint64_t land_att_hold_log_last_us = 0;
 
-            land_alt_msl = target_reached ? min_land_alt_msl : commanded_alt_msl;
-            land_vel_d   = target_reached ? 0.0f : static_cast<float>(AUTO_LAND_DESCENT_RATE_M_S);
+        if (!descent_attitude_ok &&
+                ((timestamp - land_att_hold_log_last_us) > AUTO_LAND_ATT_LOG_INTERVAL_US)) {
+            land_att_hold_log_last_us = timestamp;
 
-            if (_gps_auto_disarm_sent) {
-                land_alt_msl = min_land_alt_msl;
-                land_vel_d   = 0.0f;
-            }
-
-            _gps_land_last_alt_msl = land_alt_msl;
-            _gps_land_last_alt_valid = true;
+            PX4_INFO("\n[GPS-Land] Holding descent due attitude | pitch=%.1f deg | roll=%.1f deg | alt=%.2f\n",
+                land_att_recent ? static_cast<double>(_sim_pitch_rad * 57.2957795f) : -999.0,
+                land_att_recent ? static_cast<double>(_sim_roll_rad * 57.2957795f) : -999.0,
+                land_alt_msl);
         }
 
         _jmit_pub_n_m = _gps_land_hold_n_m;
@@ -3082,23 +3112,12 @@ void GZBridge::navSatCallback(const gz::msgs::NavSat &msg)
 // Publica sensor de distancia e aplica offsets de ataque de LiDAR ou sonar.
 void GZBridge::laserScantoLidarSensorCallback(const gz::msgs::LaserScan &msg)
 {
-    publishDistanceSensor(msg, _distance_sensor_pub, 1);
-}
-
-void GZBridge::laserScantoFrontLidarSensorCallback(const gz::msgs::LaserScan &msg)
-{
-    publishDistanceSensor(msg, _distance_sensor_front_pub, 2);
-}
-
-void GZBridge::publishDistanceSensor(const gz::msgs::LaserScan &msg, uORB::PublicationMulti<distance_sensor_s> &pub,
-                     uint8_t device_address)
-{
 
     device::Device::DeviceId id{};
     id.devid_s.bus_type = device::Device::DeviceBusType::DeviceBusType_SIMULATION;
     id.devid_s.devtype = DRV_DIST_DEVTYPE_SIM;
     id.devid_s.bus = 1;
-    id.devid_s.address = device_address;
+    id.devid_s.address = 1;
 
     distance_sensor_s report{};
     report.timestamp = hrt_absolute_time();
@@ -3166,7 +3185,7 @@ void GZBridge::publishDistanceSensor(const gz::msgs::LaserScan &msg, uORB::Publi
         _ground_distance_timestamp = report.timestamp;
     }
 
-    pub.publish(report);
+    _distance_sensor_pub.publish(report);
 }
 
 // Converte o LaserScan 2D em setores de distancia para prevencao de colisao.

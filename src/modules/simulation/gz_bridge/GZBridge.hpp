@@ -151,9 +151,6 @@ private:
     void odometryCallback(const gz::msgs::OdometryWithCovariance &msg);
     void navSatCallback(const gz::msgs::NavSat &msg);
     void laserScantoLidarSensorCallback(const gz::msgs::LaserScan &msg);
-    void laserScantoFrontLidarSensorCallback(const gz::msgs::LaserScan &msg);
-    void publishDistanceSensor(const gz::msgs::LaserScan &msg, uORB::PublicationMulti<distance_sensor_s> &pub,
-                   uint8_t device_address);
     void laserScanCallback(const gz::msgs::LaserScan &msg);
     void opticalFlowCallback(const px4::msgs::OpticalFlow &msg);
     void magnetometerCallback(const gz::msgs::Magnetometer &msg);
@@ -176,8 +173,7 @@ private:
 
     uORB::SubscriptionInterval                    _parameter_update_sub{ORB_ID(parameter_update), 1_s};
 
-    uORB::PublicationMulti<distance_sensor_s>     _distance_sensor_pub{ORB_ID(distance_sensor)};
-    uORB::PublicationMulti<distance_sensor_s>     _distance_sensor_front_pub{ORB_ID(distance_sensor)};
+    uORB::Publication<distance_sensor_s>          _distance_sensor_pub{ORB_ID(distance_sensor)};
     uORB::Publication<differential_pressure_s>    _differential_pressure_pub{ORB_ID(differential_pressure)};
     uORB::Publication<obstacle_distance_s>        _obstacle_distance_pub{ORB_ID(obstacle_distance)};
     uORB::Publication<vehicle_angular_velocity_s> _angular_velocity_ground_truth_pub{ORB_ID(vehicle_angular_velocity_groundtruth)};
@@ -323,13 +319,13 @@ private:
     static constexpr float AUTO_LAND_DEST_RADIUS_M = 1.2f;
     static constexpr float AUTO_LAND_MAX_SPEED_M_S = 0.25f;
     static constexpr float AUTO_LAND_ANOMALY_DEST_RADIUS_M = 1.2f;
-    static constexpr float AUTO_LAND_ANOMALY_MAX_SPEED_M_S = 0.35f;
+    static constexpr float AUTO_LAND_ANOMALY_MAX_SPEED_M_S = 0.45f;
     static constexpr float AUTO_LAND_SEVERE_ANOMALY_DEST_RADIUS_M = 2.0f;
-    static constexpr float AUTO_LAND_SEVERE_ANOMALY_MAX_SPEED_M_S = 1.0f;
-    static constexpr uint64_t AUTO_LAND_STABLE_US = 3000000ULL;
+    static constexpr float AUTO_LAND_SEVERE_ANOMALY_MAX_SPEED_M_S = 0.45f;
+    static constexpr uint64_t AUTO_LAND_STABLE_US = 1500000ULL;
     static constexpr uint64_t AUTO_LAND_PULSE_BRIDGE_US = 6000000ULL;
-    static constexpr uint64_t AUTO_LAND_SEVERE_STABLE_US = 3500000ULL;
-    static constexpr float AUTO_LAND_FINAL_MAX_SPEED_M_S = 0.70f;
+    static constexpr uint64_t AUTO_LAND_SEVERE_STABLE_US = 1500000ULL;
+    static constexpr float AUTO_LAND_FINAL_MAX_SPEED_M_S = 0.40f;
     static constexpr uint64_t AUTO_LAND_FINAL_MAX_WAIT_US = 8000000ULL;
     static constexpr double AUTO_LAND_SEVERE_NIS_THRESHOLD = 50000.0;
     static constexpr uint64_t AUTO_LAND_MIN_BLACKOUT_US = 500000ULL;
@@ -339,8 +335,8 @@ private:
     static constexpr double AUTO_LAND_TARGET_GPS_ANOMALY_AGL_M = 0.25;
     static constexpr uint64_t AUTO_LAND_GROUND_DISARM_MIN_US = 0ULL;
     static constexpr uint64_t AUTO_LAND_GROUND_SENSOR_TIMEOUT_US = 1000000ULL;
-    static constexpr float AUTO_LAND_GROUND_DISARM_DIST_M = 0.08f;
-    static constexpr double AUTO_LAND_SIM_GROUND_DISARM_AGL_M = 0.08;
+    static constexpr float AUTO_LAND_GROUND_DISARM_DIST_M = 0.18f;
+    static constexpr double AUTO_LAND_SIM_GROUND_DISARM_AGL_M = 0.12;
     static constexpr float AUTO_LAND_MAX_PITCH_RAD = 0.0872665f;
     static constexpr float AUTO_LAND_MAX_ROLL_RAD = 0.0872665f;
     static constexpr uint64_t AUTO_LAND_ATT_LOG_INTERVAL_US = 500000ULL;
@@ -465,7 +461,7 @@ private:
     // Contador de confirmacoes consecutivas de contato com o solo via AGL simulado.
     // Exige N amostras consecutivas abaixo do limiar antes de autorizar o desarme forcado.
     uint32_t _sim_agl_ground_count{0};
-    static constexpr uint32_t SIM_AGL_GROUND_CONFIRM_COUNT = 1;
+    static constexpr uint32_t SIM_AGL_GROUND_CONFIRM_COUNT = 5;
 
     // Estado do pouso GPS mitigado.
     bool     _gps_auto_land_sent{false};
