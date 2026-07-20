@@ -708,6 +708,40 @@ void GZBridge::attackMitigationCallback(const gz::msgs::Vector3d &msg)
     _gps_land_heading_valid = false;
     _lpos_heading_rad = 0.0f;
 
+    // Reinicia o estado da mitigacao de IMU (deteccao, linha de base, pouso).
+    _imu_baseline_initialized = false;
+    _imu_accel_norm_ewma = 9.80665;
+    _imu_accel_norm_var_ewma = 1.0;
+    _imu_gyro_norm_ewma = 0.0;
+    _imu_gyro_norm_var_ewma = 0.02;
+    _imu_anomaly_active = false;
+    _imu_anomaly_start_us = 0;
+    _imu_recovery_start_us = 0;
+    _imu_ever_armed = false;
+
+    _imu_ref_gps_prev_valid = false;
+    _imu_ref_gps_prev_us = 0;
+    _imu_ref_gps_prev_vel_n = 0.0f;
+    _imu_ref_gps_prev_vel_e = 0.0f;
+    _imu_ref_gps_accel_valid = false;
+    _imu_ref_gps_accel_us = 0;
+    _imu_ref_gps_accel_n = 0.0f;
+    _imu_ref_gps_accel_e = 0.0f;
+
+    _vio_imu_gyro_valid = false;
+    _vio_imu_gyro_us = 0;
+    _vio_imu_accel_valid = false;
+    _vio_imu_accel_us = 0;
+
+    _imu_landing_active = false;
+    _imu_auto_land_sent = false;
+    _imu_auto_disarm_sent = false;
+    _imu_auto_land_arrival_us = 0;
+    _imu_auto_land_last_arrived_us = 0;
+    _imu_land_hold_n_m = 0.0;
+    _imu_land_hold_e_m = 0.0;
+    _imu_sim_agl_ground_count = 0;
+
     if (_attack_mitigation_enabled) {
         PX4_WARN("\n[Mitigation] KF-Jamming mitigation ENABLED\n");
     } else {
@@ -958,6 +992,225 @@ void GZBridge::imuCallback(const gz::msgs::IMU &msg)
         gyro.z += static_cast<float>(_imu_active_offsets[5]);
     }
     // ======== ATAQUE IMU - FIM ========
+
+    // ======== MITIGACAO IMU - INICIO ========
+    // Deteccao de anomalia no sinal publicado do sensor (accel/gyro ja com o
+    // ataque aplicado, se houver). Combina tres verificacoes:
+    //  (1) Limites fisicos de forca especifica.
+    //  (2) Z-score contra uma linha de base (media do acelerometro fixa na
+    //      gravidade local; media/variancia do giroscopio adaptativas).
+    //  (3) Aceleracao horizontal medida pela IMU vs. aceleracao horizontal
+    //      estimada por diferenca finita da velocidade GPS.
+    
+    // A deteccao so roda depois que o veiculo esteve armado e voando (nao
+    // pousado) pela primeira vez desde que a mitigacao foi habilitada.
+    actuator_armed_s imu_actuator_armed{};
+    const bool imu_armed_available = _actuator_armed_sub.copy(&imu_actuator_armed);
+    const bool imu_vehicle_armed = imu_armed_available && imu_actuator_armed.armed;
+
+    vehicle_land_detected_s imu_land_detected{};
+    const bool imu_land_detector_available = _vehicle_land_detected_sub.copy(&imu_land_detected);
+    const bool imu_vehicle_not_landed = imu_land_detector_available && !imu_land_detected.landed;
+
+    if (imu_vehicle_armed && imu_vehicle_not_landed) {
+        _imu_ever_armed = true;
+    }
+
+    if (_attack_mitigation_enabled && _imu_ever_armed) {
+
+        const double accel_x_d = static_cast<double>(accel.x);
+        const double accel_y_d = static_cast<double>(accel.y);
+        const double accel_z_d = static_cast<double>(accel.z);
+        const double gyro_x_d  = static_cast<double>(gyro.x);
+        const double gyro_y_d  = static_cast<double>(gyro.y);
+        const double gyro_z_d  = static_cast<double>(gyro.z);
+
+        const double accel_norm = sqrt(
+            accel_x_d * accel_x_d +
+            accel_y_d * accel_y_d +
+            accel_z_d * accel_z_d);
+
+        const double gyro_norm = sqrt(
+            gyro_x_d * gyro_x_d +
+            gyro_y_d * gyro_y_d +
+            gyro_z_d * gyro_z_d);
+
+        // (1) Limites fisicos de forca especifica.
+        const bool accel_out_of_bounds =
+            !PX4_ISFINITE(accel_norm) ||
+            (accel_norm < IMU_ACCEL_NORM_MIN_MS2) ||
+            (accel_norm > IMU_ACCEL_NORM_MAX_MS2);
+
+        // (2) Z-score contra a linha de base.
+        const double accel_std = sqrt(math::max(_imu_accel_norm_var_ewma, 1e-6));
+        const double accel_z = fabs(accel_norm - _imu_accel_norm_ewma) / accel_std;
+
+        double gyro_z = 0.0;
+
+        if (_imu_baseline_initialized) {
+            const double gyro_std = sqrt(math::max(_imu_gyro_norm_var_ewma, 1e-6));
+            gyro_z = fabs(gyro_norm - _imu_gyro_norm_ewma) / gyro_std;
+        }
+
+        const bool statistical_anomaly =
+            (accel_z > IMU_ZSCORE_THRESHOLD) ||
+            (_imu_baseline_initialized && (gyro_z > IMU_ZSCORE_THRESHOLD));
+
+        // (3) Aceleracao horizontal da IMU vs. aceleracao horizontal do GPS.
+        // So se aplica quando a referencia de GPS esta recente.
+        const bool gps_ref_recent =
+            _imu_ref_gps_accel_valid &&
+            (timestamp >= _imu_ref_gps_accel_us) &&
+            ((timestamp - _imu_ref_gps_accel_us) <= IMU_REF_GPS_MAX_AGE_US);
+
+        double gps_crosscheck_residual = 0.0;
+        bool gps_crosscheck_anomaly = false;
+
+        if (gps_ref_recent) {
+            const double accel_horiz = sqrt(accel_x_d * accel_x_d + accel_y_d * accel_y_d);
+
+            const double gps_accel_n_d = static_cast<double>(_imu_ref_gps_accel_n);
+            const double gps_accel_e_d = static_cast<double>(_imu_ref_gps_accel_e);
+            const double gps_horiz = sqrt(gps_accel_n_d * gps_accel_n_d + gps_accel_e_d * gps_accel_e_d);
+
+            gps_crosscheck_residual = fabs(accel_horiz - gps_horiz);
+            gps_crosscheck_anomaly = gps_crosscheck_residual > IMU_CROSSCHECK_RESIDUAL_MAX_MS2;
+        }
+
+        const bool sample_anomalous =
+            accel_out_of_bounds || statistical_anomaly || gps_crosscheck_anomaly;
+
+        // Anomalia severa: violacao fisica dura (limites/GPS) ou z-score acima
+        // de IMU_ZSCORE_SEVERE_THRESHOLD. Usa a janela de confirmacao reduzida.
+        const bool sample_severe =
+            accel_out_of_bounds ||
+            gps_crosscheck_anomaly ||
+            (accel_z > IMU_ZSCORE_SEVERE_THRESHOLD) ||
+            (_imu_baseline_initialized && (gyro_z > IMU_ZSCORE_SEVERE_THRESHOLD));
+
+        // Log periodico de diagnostico, apenas enquanto a anomalia esta ativa.
+        if (_imu_anomaly_active) {
+            static uint64_t imu_mitig_diag_last_us = 0;
+
+            if ((timestamp - imu_mitig_diag_last_us) > 1000000ULL) {
+                imu_mitig_diag_last_us = timestamp;
+
+                PX4_INFO("\n[IMU-Mitig] Status | accel_norm=%.2f (z=%.1f) gyro_norm=%.3f (z=%.1f) | "
+                    "gps_ref=%s residual=%.2f\n",
+                    accel_norm, accel_z, gyro_norm, gyro_z,
+                    gps_ref_recent ? "ok" : "stale",
+                    gps_crosscheck_residual);
+            }
+        }
+
+        if (!sample_anomalous) {
+
+            // Atualiza a linha de base com a amostra saudavel. A media do
+            // acelerometro permanece fixa; variancia do acelerometro e
+            // media/variancia do giroscopio se adaptam.
+            if (!_imu_baseline_initialized) {
+                _imu_gyro_norm_ewma  = gyro_norm;
+                _imu_accel_norm_var_ewma = 1.0;
+                _imu_gyro_norm_var_ewma  = 0.1;
+                _imu_baseline_initialized = true;
+
+            } else {
+                const double d_accel = accel_norm - _imu_accel_norm_ewma;
+                const double d_gyro  = gyro_norm - _imu_gyro_norm_ewma;
+
+                _imu_gyro_norm_ewma += IMU_BASELINE_ALPHA * d_gyro;
+
+                _imu_accel_norm_var_ewma =
+                    (1.0 - IMU_BASELINE_ALPHA) * _imu_accel_norm_var_ewma +
+                    IMU_BASELINE_ALPHA * d_accel * d_accel;
+
+                _imu_gyro_norm_var_ewma =
+                    (1.0 - IMU_BASELINE_ALPHA) * _imu_gyro_norm_var_ewma +
+                    IMU_BASELINE_ALPHA * d_gyro * d_gyro;
+
+                _imu_accel_norm_var_ewma = math::constrain(_imu_accel_norm_var_ewma, 0.05, 4.0);
+                _imu_gyro_norm_var_ewma  = math::constrain(_imu_gyro_norm_var_ewma, 0.02, 2.0);
+            }
+
+            _imu_recovery_start_us = 0;
+
+            if (_imu_anomaly_active) {
+                // Confirma recuperacao apos um intervalo estavel sem anomalia.
+                if (_imu_recovery_start_us == 0) {
+                    _imu_recovery_start_us = timestamp;
+
+                } else if ((timestamp - _imu_recovery_start_us) >= IMU_RECOVERY_CONFIRM_US) {
+                    _imu_anomaly_active = false;
+                    _imu_anomaly_start_us = 0;
+
+                    PX4_INFO("\n[IMU-Mitig] Sensor anomaly cleared | accel_norm=%.2f gyro_norm=%.3f\n",
+                        accel_norm, gyro_norm);
+                }
+            }
+
+        } else {
+
+            _imu_recovery_start_us = 0;
+
+            if (_imu_anomaly_start_us == 0) {
+                _imu_anomaly_start_us = timestamp;
+            }
+
+            const uint64_t confirm_required_us =
+                sample_severe ? IMU_ANOMALY_CONFIRM_SEVERE_US : IMU_ANOMALY_CONFIRM_US;
+
+            if (!_imu_anomaly_active &&
+                    ((timestamp - _imu_anomaly_start_us) >= confirm_required_us)) {
+                _imu_anomaly_active = true;
+
+                PX4_WARN("\n[IMU-Mitig] Sensor anomaly detected | accel_norm=%.2f (z=%.1f) gyro_norm=%.3f (z=%.1f) | "
+                    "bounds=%s gps_residual=%.2f (%s) | severe=%s confirm=%.0fms\n",
+                    accel_norm, accel_z, gyro_norm, gyro_z,
+                    accel_out_of_bounds ? "out" : "ok",
+                    gps_crosscheck_residual,
+                    gps_crosscheck_anomaly ? "anomalous" : (gps_ref_recent ? "ok" : "stale"),
+                    sample_severe ? "yes" : "no",
+                    static_cast<double>(confirm_required_us) / 1000.0);
+            }
+
+            // Substitui accel/gyro pelo substituto dinamico reconstruido a
+            // partir da VIO (ver bloco de reconstrucao em odometryCallback).
+            if (_imu_anomaly_active) {
+                const bool vio_accel_recent =
+                    _vio_imu_accel_valid &&
+                    (timestamp >= _vio_imu_accel_us) &&
+                    ((timestamp - _vio_imu_accel_us) <= IMU_VIO_SUBSTITUTE_MAX_AGE_US);
+
+                const bool vio_gyro_recent =
+                    _vio_imu_gyro_valid &&
+                    (timestamp >= _vio_imu_gyro_us) &&
+                    ((timestamp - _vio_imu_gyro_us) <= IMU_VIO_SUBSTITUTE_MAX_AGE_US);
+
+                if (vio_accel_recent) {
+                    accel.x = _vio_imu_accel_body[0];
+                    accel.y = _vio_imu_accel_body[1];
+                    accel.z = _vio_imu_accel_body[2];
+                }
+
+                if (vio_gyro_recent) {
+                    gyro.x = _vio_imu_gyro_body[0];
+                    gyro.y = _vio_imu_gyro_body[1];
+                    gyro.z = _vio_imu_gyro_body[2];
+                }
+
+                static uint64_t vio_substitute_log_last_us = 0;
+
+                if ((timestamp - vio_substitute_log_last_us) > 1000000ULL) {
+                    vio_substitute_log_last_us = timestamp;
+
+                    PX4_INFO("\n[IMU-Mitig] VIO substitute | accel=%s gyro=%s\n",
+                        vio_accel_recent ? "active" : "stale",
+                        vio_gyro_recent ? "active" : "stale");
+                }
+            }
+        }
+    }
+    // ======== MITIGACAO IMU - FIM ========
 
     _sensor_accel_pub.publish(accel);
     _sensor_gyro_pub.publish(gyro);
@@ -1465,6 +1718,11 @@ void GZBridge::imuCallback(const gz::msgs::IMU &msg)
     checkGpsAutoDisarm(timestamp);
     // ======== MITIGACAO DE POUSO GPS - FIM ========
 
+    // ======== MITIGACAO DE POUSO IMU - INICIO ========
+    checkImuAutoLand(timestamp);
+    checkImuAutoDisarm(timestamp);
+    // ======== MITIGACAO DE POUSO IMU - FIM ========
+
 }
 
 // ======== MITIGACAO DE POUSO GPS - INICIO ========
@@ -1970,6 +2228,249 @@ void GZBridge::publishGpsDisarmCommand(uint64_t timestamp, bool force_disarm)
 }
 // ======== MITIGACAO DE POUSO GPS - FIM ========
 
+// ======== MITIGACAO DE POUSO IMU - INICIO ========
+// Controla o pouso quando a mitigacao de IMU esta ativa e uma anomalia foi confirmada.
+// Reaproveita a mesma logica de chegada ao destino da mitigacao GPS (raio/velocidade/
+// janela de estabilidade), mas a origem do gatilho e a anomalia detectada no sinal IMU.
+void GZBridge::checkImuAutoLand(uint64_t timestamp)
+{
+    if (!_attack_mitigation_enabled || !_imu_anomaly_active ||
+            _imu_auto_land_sent || !_pos_ref.isInitialized()) {
+        _imu_auto_land_arrival_us = 0;
+        _imu_auto_land_last_arrived_us = 0;
+        return;
+    }
+
+    if (!_lpos_xy_valid || (timestamp - _lpos_timestamp) > 500000ULL) {
+        _imu_auto_land_arrival_us = 0;
+        _imu_auto_land_last_arrived_us = 0;
+        return;
+    }
+
+    position_setpoint_triplet_s triplet{};
+
+    if (!_pos_sp_triplet_sub.copy(&triplet) || !triplet.current.valid ||
+            !PX4_ISFINITE(triplet.current.lat) || !PX4_ISFINITE(triplet.current.lon)) {
+        _imu_auto_land_arrival_us = 0;
+        _imu_auto_land_last_arrived_us = 0;
+        return;
+    }
+
+    float dest_n_m = 0.0f;
+    float dest_e_m = 0.0f;
+    _pos_ref.project(triplet.current.lat, triplet.current.lon, dest_n_m, dest_e_m);
+
+    const double dn = _lpos_n_m - static_cast<double>(dest_n_m);
+    const double de = _lpos_e_m - static_cast<double>(dest_e_m);
+    const float horizontal_error = static_cast<float>(sqrt(dn * dn + de * de));
+
+    const bool arrived =
+        (horizontal_error <= AUTO_LAND_ANOMALY_DEST_RADIUS_M) &&
+        (_lpos_ground_speed <= AUTO_LAND_ANOMALY_MAX_SPEED_M_S);
+
+    if (!arrived) {
+        _imu_auto_land_arrival_us = 0;
+        _imu_auto_land_last_arrived_us = 0;
+        return;
+    }
+
+    _imu_auto_land_last_arrived_us = timestamp;
+
+    if (_imu_auto_land_arrival_us == 0) {
+        _imu_auto_land_arrival_us = timestamp;
+
+        _imu_land_hold_n_m = _lpos_n_m;
+        _imu_land_hold_e_m = _lpos_e_m;
+
+        PX4_INFO("\n[IMU-Land] Destination reached | err_xy=%.1f m | vel=%.2f m/s | window=%.1f s\n",
+            static_cast<double>(horizontal_error),
+            static_cast<double>(_lpos_ground_speed),
+            static_cast<double>(AUTO_LAND_STABLE_US) / 1e6);
+
+        return;
+    }
+
+    const uint64_t preland_elapsed_us = timestamp - _imu_auto_land_arrival_us;
+
+    if (preland_elapsed_us < AUTO_LAND_STABLE_US) {
+        return;
+    }
+
+    _imu_landing_active = true;
+    _imu_auto_land_sent = true;
+
+    publishImuLandCommand(timestamp);
+}
+
+// Envia comando de desarme assim que o detector de pouso do PX4 (ou, em ultimo caso,
+// os sensores de ground-truth do Gazebo usados apenas para confirmar o solo) indicar
+// contato com o solo. A anomalia de IMU em si nunca e usada como criterio aqui.
+void GZBridge::checkImuAutoDisarm(uint64_t timestamp)
+{
+    if (!_imu_landing_active || !_imu_auto_land_sent || _imu_auto_disarm_sent) {
+        return;
+    }
+
+    vehicle_land_detected_s land_detected{};
+    const bool land_detector_available = _vehicle_land_detected_sub.copy(&land_detected);
+
+    const bool land_detector_recent =
+        land_detector_available &&
+        (land_detected.timestamp > 0) &&
+        (timestamp >= land_detected.timestamp) &&
+        ((timestamp - land_detected.timestamp) <= AUTO_LAND_GROUND_SENSOR_TIMEOUT_US);
+
+    const bool ground_contact_by_px4_landed =
+        land_detector_recent && land_detected.landed;
+
+    const bool ground_contact_by_px4_early =
+        land_detector_recent &&
+        (land_detected.ground_contact || land_detected.maybe_landed);
+
+    const bool ground_sensor_recent =
+        _ground_distance_valid &&
+        ((timestamp - _ground_distance_timestamp) <= AUTO_LAND_GROUND_SENSOR_TIMEOUT_US);
+
+    const bool ground_contact_by_sensor =
+        ground_sensor_recent &&
+        PX4_ISFINITE(_ground_distance_m) &&
+        (_ground_distance_m <= AUTO_LAND_GROUND_DISARM_DIST_M);
+
+    // Ground-truth do Gazebo (pose do modelo), usado exclusivamente para confirmar
+    // contato com o solo durante o pouso, nunca para detectar a anomalia de IMU.
+    const bool sim_ground_recent =
+        _sim_agl_valid &&
+        (timestamp >= _sim_agl_timestamp) &&
+        ((timestamp - _sim_agl_timestamp) <= AUTO_LAND_GROUND_SENSOR_TIMEOUT_US) &&
+        PX4_ISFINITE(_sim_agl_m);
+
+    if (sim_ground_recent) {
+        if (_sim_agl_m <= AUTO_LAND_SIM_GROUND_DISARM_AGL_M) {
+            _imu_sim_agl_ground_count++;
+        } else {
+            _imu_sim_agl_ground_count = 0;
+        }
+    } else {
+        _imu_sim_agl_ground_count = 0;
+    }
+
+    const bool ground_contact_by_sim_agl =
+        sim_ground_recent &&
+        (_sim_agl_m <= AUTO_LAND_SIM_GROUND_DISARM_AGL_M) &&
+        (_imu_sim_agl_ground_count >= SIM_AGL_GROUND_CONFIRM_COUNT);
+
+    if (!ground_contact_by_px4_landed &&
+            !ground_contact_by_px4_early &&
+            !ground_contact_by_sensor &&
+            !ground_contact_by_sim_agl) {
+        return;
+    }
+
+    const bool force_disarm = !ground_contact_by_px4_landed;
+
+    const bool disarm_att_recent =
+        _sim_att_valid &&
+        (timestamp >= _sim_att_timestamp) &&
+        ((timestamp - _sim_att_timestamp) <= 500000ULL);
+
+    const bool forced_disarm_speed_ok = (_lpos_ground_speed <= 0.15f);
+
+    const bool forced_disarm_att_ok =
+        !disarm_att_recent ||
+        ((fabsf(_sim_roll_rad) <= AUTO_LAND_MAX_ROLL_RAD) &&
+        (fabsf(_sim_pitch_rad) <= AUTO_LAND_MAX_PITCH_RAD));
+
+    if (force_disarm && (!forced_disarm_speed_ok || !forced_disarm_att_ok)) {
+        return;
+    }
+
+    if (ground_contact_by_px4_landed) {
+        PX4_WARN("\n[IMU-Land] PX4 landing detector confirmed landed - normal disarm\n");
+
+    } else if (ground_contact_by_px4_early) {
+        PX4_WARN("\n[IMU-Land] PX4 landing detector reported ground contact - safety disarm\n");
+
+    } else if (ground_contact_by_sensor) {
+        PX4_WARN("\n[IMU-Land] Downward distance sensor reported ground contact | dist=%.2f m - safety disarm\n",
+            static_cast<double>(_ground_distance_m));
+
+    } else {
+        PX4_WARN("\n[IMU-Land] Simulated ground proximity reached | agl=%.2f m - safety disarm\n",
+            static_cast<double>(_sim_agl_m));
+    }
+
+    publishImuDisarmCommand(timestamp, force_disarm);
+    _imu_auto_disarm_sent = true;
+    _imu_auto_land_sent = true;
+    _imu_landing_active = false;
+}
+
+// Envia LAND com coordenada global explicita no ponto de chegada (posicao fixa;
+// a descida vertical fica sob controle do modo LAND do PX4).
+void GZBridge::publishImuLandCommand(uint64_t timestamp)
+{
+    double land_lat = 0.0;
+    double land_lon = 0.0;
+    _pos_ref.reproject(
+        static_cast<float>(_imu_land_hold_n_m),
+        static_cast<float>(_imu_land_hold_e_m),
+        land_lat,
+        land_lon);
+
+    vehicle_command_s cmd{};
+    cmd.timestamp = timestamp;
+    cmd.param1 = 0.0f;
+    cmd.param2 = 0.0f;
+    cmd.param3 = 0.0f;
+    cmd.param4 = NAN;
+    cmd.param5 = static_cast<float>(land_lat);
+    cmd.param6 = static_cast<float>(land_lon);
+    cmd.param7 = NAN;
+
+    cmd.command = vehicle_command_s::VEHICLE_CMD_NAV_LAND;
+    cmd.target_system = 1;
+    cmd.target_component = 1;
+    cmd.source_system = 1;
+    cmd.source_component = 1;
+    cmd.confirmation = 0;
+    cmd.from_external = false;
+
+    _vehicle_command_pub.publish(cmd);
+
+    PX4_WARN("\n[IMU-Land] Controlled landing started | hold N=%.1f E=%.1f | lat=%.7f lon=%.7f\n",
+        _imu_land_hold_n_m,
+        _imu_land_hold_e_m,
+        land_lat,
+        land_lon);
+}
+
+// Envia o comando de desarme do PX4 apos confirmacao de contato com o solo.
+void GZBridge::publishImuDisarmCommand(uint64_t timestamp, bool force_disarm)
+{
+    vehicle_command_s cmd{};
+    cmd.timestamp = timestamp;
+    cmd.param1 = 0.0f;
+    cmd.param2 = force_disarm ? 21196.0f : 0.0f;
+    cmd.param3 = 0.0f;
+    cmd.param4 = 0.0f;
+    cmd.param5 = 0.0f;
+    cmd.param6 = 0.0f;
+    cmd.param7 = 0.0f;
+    cmd.command = vehicle_command_s::VEHICLE_CMD_COMPONENT_ARM_DISARM;
+    cmd.target_system = 1;
+    cmd.target_component = 1;
+    cmd.source_system = 1;
+    cmd.source_component = 1;
+    cmd.confirmation = 0;
+    cmd.from_external = false;
+
+    _vehicle_command_pub.publish(cmd);
+
+    PX4_WARN("\n[IMU-Land] %s disarm command sent after ground contact confirmation.\n",
+        force_disarm ? "Forced" : "Normal");
+}
+// ======== MITIGACAO DE POUSO IMU - FIM ========
+
 // ======== MITIGACAO BLACKOUT GPS - INICIO ========
 // Publica uma pseudo-medicao GPS durante blackout usando VIO quando disponivel
 // ou dead-reckoning horizontal a partir da ultima velocidade confiavel.
@@ -2219,6 +2720,14 @@ void GZBridge::odometryCallback(const gz::msgs::OdometryWithCovariance &msg)
     report.position[1] = msg.pose_with_covariance().pose().position().x();
     report.position[2] = -msg.pose_with_covariance().pose().position().z();
 
+    // Variaveis usadas mais abaixo (apos o quaternion ser calculado) para
+    // reconstruir o substituto dinamico de IMU a partir da VIO.
+    bool   vio_sample_accepted = false;
+    double vio_accel_n_ned = 0.0;
+    double vio_accel_e_ned = 0.0;
+    double vio_accel_d_ned = 0.0;
+    bool   vio_accel_ned_valid = false;
+
     // ======== MITIGACAO BLACKOUT GPS - INICIO ========
     // Cache VIO used as auxiliary localization during GPS blackout.
     // The cache is accepted only when covariance and motion are plausible.
@@ -2255,6 +2764,18 @@ void GZBridge::odometryCallback(const gz::msgs::OdometryWithCovariance &msg)
             vio_vel_e = static_cast<float>((vio_e - _vio_e_m) / dt);
             vio_vel_d = static_cast<float>((vio_d - _vio_d_m) / dt);
 
+            // ======== MITIGACAO IMU - INICIO ========
+            // Aceleracao NED por diferenca finita da velocidade VIO (valor
+            // anterior de _vio_vel_n/e/d contra a nova estimativa, mesmo dt).
+            vio_accel_n_ned = (static_cast<double>(vio_vel_n) - static_cast<double>(_vio_vel_n)) / dt;
+            vio_accel_e_ned = (static_cast<double>(vio_vel_e) - static_cast<double>(_vio_vel_e)) / dt;
+            vio_accel_d_ned = (static_cast<double>(vio_vel_d) - static_cast<double>(_vio_vel_d)) / dt;
+            vio_accel_ned_valid =
+                PX4_ISFINITE(vio_accel_n_ned) &&
+                PX4_ISFINITE(vio_accel_e_ned) &&
+                PX4_ISFINITE(vio_accel_d_ned);
+            // ======== MITIGACAO IMU - FIM ========
+
             const float vio_speed_xy = sqrtf(vio_vel_n * vio_vel_n + vio_vel_e * vio_vel_e);
             vio_motion_valid =
                 PX4_ISFINITE(vio_speed_xy) &&
@@ -2273,6 +2794,7 @@ void GZBridge::odometryCallback(const gz::msgs::OdometryWithCovariance &msg)
             _vio_vel_d = math::constrain(vio_vel_d, -JMIT_DR_VEL_Z_MAX_M_S, JMIT_DR_VEL_Z_MAX_M_S);
             _vio_timestamp = timestamp;
             _vio_valid = true;
+            vio_sample_accepted = true;
         } else {
             _vio_valid = false;
         }
@@ -2291,6 +2813,53 @@ void GZBridge::odometryCallback(const gz::msgs::OdometryWithCovariance &msg)
     report.q[1] = q_nb.X();
     report.q[2] = q_nb.Y();
     report.q[3] = q_nb.Z();
+
+    // ======== MITIGACAO IMU - INICIO ========
+    // Reconstroi accel/gyro a partir da VIO (odometria visual), recalculado a
+    // cada atualizacao. Consumido em imuCallback quando uma anomalia esta ativa.
+    if (vio_sample_accepted) {
+
+        // Aceleracao: aceleracao NED (por diferenca da velocidade VIO) menos a
+        // gravidade local, rotacionada para o corpo usando a atitude da propria VIO.
+        if (vio_accel_ned_valid) {
+            const matrix::Quatf q_nb_matrix(q_nb.W(), q_nb.X(), q_nb.Y(), q_nb.Z());
+            const matrix::Dcmf dcm_bn(q_nb_matrix); // corpo -> NED
+
+            const matrix::Vector3f specific_force_ned(
+                static_cast<float>(vio_accel_n_ned),
+                static_cast<float>(vio_accel_e_ned),
+                static_cast<float>(vio_accel_d_ned - 9.80665));
+
+            const matrix::Vector3f specific_force_body = dcm_bn.transpose() * specific_force_ned;
+
+            if (PX4_ISFINITE(specific_force_body(0)) &&
+                    PX4_ISFINITE(specific_force_body(1)) &&
+                    PX4_ISFINITE(specific_force_body(2))) {
+                _vio_imu_accel_body[0] = specific_force_body(0);
+                _vio_imu_accel_body[1] = specific_force_body(1);
+                _vio_imu_accel_body[2] = specific_force_body(2);
+                _vio_imu_accel_valid = true;
+                _vio_imu_accel_us = timestamp;
+            }
+        }
+
+        // Giroscopio: a velocidade angular do proprio corpo ja vem pronta na
+        // mensagem de odometria (twist.angular), sem necessidade de diferenciar
+        // quaternion. Mesma convencao de sinal usada para a velocidade linear
+        // (FLU -> FRD: X mantido, Y e Z invertidos).
+        const float vio_gyro_x = static_cast<float>(msg.twist_with_covariance().twist().angular().x());
+        const float vio_gyro_y = static_cast<float>(-msg.twist_with_covariance().twist().angular().y());
+        const float vio_gyro_z = static_cast<float>(-msg.twist_with_covariance().twist().angular().z());
+
+        if (PX4_ISFINITE(vio_gyro_x) && PX4_ISFINITE(vio_gyro_y) && PX4_ISFINITE(vio_gyro_z)) {
+            _vio_imu_gyro_body[0] = vio_gyro_x;
+            _vio_imu_gyro_body[1] = vio_gyro_y;
+            _vio_imu_gyro_body[2] = vio_gyro_z;
+            _vio_imu_gyro_valid = true;
+            _vio_imu_gyro_us = timestamp;
+        }
+    }
+    // ======== MITIGACAO IMU - FIM ========
 
     // Velocidade linear convertida de FLU para FRD.
     report.velocity_frame = vehicle_odometry_s::VELOCITY_FRAME_BODY_FRD;
@@ -3103,6 +3672,33 @@ void GZBridge::navSatCallback(const gz::msgs::NavSat &msg)
         _gps_real_vel_n = vel_north;
         _gps_real_vel_e = vel_east;
         _gps_real_vel_d = vel_down;
+
+        // ======== MITIGACAO IMU - INICIO ========
+        // Aceleracao horizontal por diferenca finita da velocidade GPS, usada
+        // em imuCallback como referencia cruzada para o acelerometro.
+        if (_imu_ref_gps_prev_valid && (timestamp > _imu_ref_gps_prev_us)) {
+            const double dt_ref = static_cast<double>(timestamp - _imu_ref_gps_prev_us) * 1e-6;
+
+            if (dt_ref >= IMU_REF_GPS_MIN_DT_S && dt_ref <= IMU_REF_GPS_MAX_DT_S) {
+                const double accel_n_est =
+                    (static_cast<double>(vel_north) - static_cast<double>(_imu_ref_gps_prev_vel_n)) / dt_ref;
+                const double accel_e_est =
+                    (static_cast<double>(vel_east) - static_cast<double>(_imu_ref_gps_prev_vel_e)) / dt_ref;
+
+                if (PX4_ISFINITE(accel_n_est) && PX4_ISFINITE(accel_e_est)) {
+                    _imu_ref_gps_accel_n = static_cast<float>(accel_n_est);
+                    _imu_ref_gps_accel_e = static_cast<float>(accel_e_est);
+                    _imu_ref_gps_accel_valid = true;
+                    _imu_ref_gps_accel_us = timestamp;
+                }
+            }
+        }
+
+        _imu_ref_gps_prev_vel_n = vel_north;
+        _imu_ref_gps_prev_vel_e = vel_east;
+        _imu_ref_gps_prev_us = timestamp;
+        _imu_ref_gps_prev_valid = true;
+        // ======== MITIGACAO IMU - FIM ========
     }
     // ======== MITIGACAO BLACKOUT GPS - FIM ========
 

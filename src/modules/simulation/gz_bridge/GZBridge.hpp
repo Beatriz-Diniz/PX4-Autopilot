@@ -69,6 +69,7 @@
 #include <uORB/topics/position_setpoint_triplet.h>
 #include <uORB/topics/vehicle_command.h>
 #include <uORB/topics/vehicle_land_detected.h>
+#include <uORB/topics/actuator_armed.h>
 
 #include <gz/math.hh>
 #include <gz/msgs.hh>
@@ -164,6 +165,14 @@ private:
     void publishGpsLandCommand(uint64_t timestamp);
     void publishGpsDisarmCommand(uint64_t timestamp, bool force_disarm);
 
+    // Pouso/desarme para a mitigacao de IMU. Mesma logica do pouso GPS: so usa
+    // variaveis de ground-truth do Gazebo (_sim_agl_m/_sim_roll_rad/_sim_pitch_rad,
+    // land_detected) para confirmar contato com o solo, nunca para detectar o ataque.
+    void checkImuAutoLand(uint64_t timestamp);
+    void checkImuAutoDisarm(uint64_t timestamp);
+    void publishImuLandCommand(uint64_t timestamp);
+    void publishImuDisarmCommand(uint64_t timestamp, bool force_disarm);
+
     static void rotateQuaternion(gz::math::Quaterniond &q_FRD_to_NED, const gz::math::Quaterniond q_FLU_to_ENU);
 
     static float generate_wgn();
@@ -190,6 +199,7 @@ private:
     uORB::Publication<vehicle_command_s>          _vehicle_command_pub{ORB_ID(vehicle_command)};
     uORB::Subscription                            _pos_sp_triplet_sub{ORB_ID(position_setpoint_triplet)};
     uORB::Subscription                            _vehicle_land_detected_sub{ORB_ID(vehicle_land_detected)};
+    uORB::Subscription                            _actuator_armed_sub{ORB_ID(actuator_armed)};
 
     GZMixingInterfaceESC   _mixing_interface_esc{_node};
     GZMixingInterfaceServo _mixing_interface_servo{_node};
@@ -222,6 +232,90 @@ private:
     bool _imu_disabled{false};
     double _imu_temp_offsets[6]{0.0, 0.0, 0.0, 0.0, 0.0, 0.0};
     double _imu_active_offsets[6]{0.0, 0.0, 0.0, 0.0, 0.0, 0.0};
+
+    // ======== MITIGACAO IMU - ESTADO ========
+
+    // Linha de base adaptativa da leitura do sensor (media do acelerometro fixa
+    // na gravidade local; variancia e media do giroscopio se adaptam). Atualizada
+    // apenas com amostras consideradas saudaveis.
+    bool   _imu_baseline_initialized{false};
+    double _imu_accel_norm_ewma{9.80665};
+    double _imu_accel_norm_var_ewma{1.0};
+    double _imu_gyro_norm_ewma{0.0};
+    double _imu_gyro_norm_var_ewma{0.02};
+
+    bool     _imu_anomaly_active{false};
+    uint64_t _imu_anomaly_start_us{0};
+    uint64_t _imu_recovery_start_us{0};
+
+    // Marca se o veiculo ja esteve armado e voando (nao pousado) desde que a
+    // mitigacao foi habilitada. A deteccao so roda depois disso.
+    bool _imu_ever_armed{false};
+
+    // Limites fisicos de forca especifica: proximo de zero indica sensor zerado;
+    // muito acima do plausivel indica offset/spoofing grosseiro.
+    static constexpr double IMU_ACCEL_NORM_MIN_MS2   = 2.0;   // ~0.2 g
+    static constexpr double IMU_ACCEL_NORM_MAX_MS2   = 39.0;  // ~4 g
+    // Limiar estatistico (z-score) sobre a linha de base adaptativa do sinal IMU.
+    static constexpr double IMU_ZSCORE_THRESHOLD     = 6.0;
+    // Limiar de severidade: acima deste z-score, a anomalia e confirmada com a
+    // janela reduzida (IMU_ANOMALY_CONFIRM_SEVERE_US) em vez da janela padrao.
+    static constexpr double IMU_ZSCORE_SEVERE_THRESHOLD = 12.0;
+    static constexpr double IMU_BASELINE_ALPHA       = 0.01;
+    // Tempo minimo sustentado para confirmar anomalia/recuperacao.
+    static constexpr uint64_t IMU_ANOMALY_CONFIRM_US  = 300000ULL;  // 300 ms
+    static constexpr uint64_t IMU_ANOMALY_CONFIRM_SEVERE_US = 20000ULL; // 20 ms
+    static constexpr uint64_t IMU_RECOVERY_CONFIRM_US = 500000ULL;  // 500 ms
+
+    // Pouso automatico mitigado por anomalia de IMU (mesma logica do pouso GPS).
+    // A altitude de descida fica sob controle do modo LAND do PX4 (nao e
+    // sintetizada aqui como no pouso de blackout GPS), entao so a posicao
+    // horizontal de chegada precisa ser mantida.
+    bool     _imu_landing_active{false};
+    bool     _imu_auto_land_sent{false};
+    bool     _imu_auto_disarm_sent{false};
+    uint64_t _imu_auto_land_arrival_us{0};
+    uint64_t _imu_auto_land_last_arrived_us{0};
+    double   _imu_land_hold_n_m{0.0};
+    double   _imu_land_hold_e_m{0.0};
+    // Contador de confirmacoes consecutivas de contato com o solo via AGL simulado (uso exclusivo do pouso IMU).
+    uint32_t _imu_sim_agl_ground_count{0};
+
+    // Referencia cruzada com o GPS real: aceleracao horizontal estimada por
+    // diferenca finita da velocidade GPS, usada para validar a aceleracao
+    // horizontal medida pelo acelerometro.
+    bool     _imu_ref_gps_prev_valid{false};
+    uint64_t _imu_ref_gps_prev_us{0};
+    float    _imu_ref_gps_prev_vel_n{0.0f};
+    float    _imu_ref_gps_prev_vel_e{0.0f};
+
+    bool     _imu_ref_gps_accel_valid{false};
+    uint64_t _imu_ref_gps_accel_us{0};
+    float    _imu_ref_gps_accel_n{0.0f};
+    float    _imu_ref_gps_accel_e{0.0f};
+
+    static constexpr uint64_t IMU_REF_GPS_MAX_AGE_US = 800000ULL; // 800 ms
+    static constexpr double   IMU_REF_GPS_MIN_DT_S   = 0.05;
+    static constexpr double   IMU_REF_GPS_MAX_DT_S   = 2.0;
+    // Tolerancia fixa (nao adaptativa) entre a aceleracao horizontal da IMU e a do GPS.
+    static constexpr double   IMU_CROSSCHECK_RESIDUAL_MAX_MS2 = 4.0;
+
+    // ======== MITIGACAO IMU - SUBSTITUTO DINAMICO VIA VIO ========
+    // Accel/gyro reconstruidos a partir da odometria visual (VIO): a velocidade
+    // angular vem diretamente da mensagem de odometria, e a aceleracao vem da
+    // diferenca finita da velocidade VIO (NED), rotacionada para o corpo e com a
+    // gravidade subtraida. Recalculado a cada atualizacao de VIO.
+    bool     _vio_imu_gyro_valid{false};
+    uint64_t _vio_imu_gyro_us{0};
+    float    _vio_imu_gyro_body[3]{0.0f, 0.0f, 0.0f};
+
+    bool     _vio_imu_accel_valid{false};
+    uint64_t _vio_imu_accel_us{0};
+    float    _vio_imu_accel_body[3]{0.0f, 0.0f, -9.80665f};
+
+    // Idade maxima aceita para o substituto de VIO antes de ser considerado obsoleto.
+    static constexpr uint64_t IMU_VIO_SUBSTITUTE_MAX_AGE_US = 400000ULL; // 400 ms
+    // ======== MITIGACAO IMU - FIM ========
 
     // Ataque de magnetometro
     int _mag_attack_option{0};
