@@ -742,6 +742,18 @@ void GZBridge::attackMitigationCallback(const gz::msgs::Vector3d &msg)
     _imu_land_hold_e_m = 0.0;
     _imu_sim_agl_ground_count = 0;
 
+    // Reinicia o estado de pouso/desarme da mitigacao de motor. A deteccao e
+    // a correcao em si vivem em GZMixingInterfaceESC, avisadas via setMitigationEnabled.
+    _motor_landing_active = false;
+    _motor_auto_land_sent = false;
+    _motor_auto_disarm_sent = false;
+    _motor_auto_land_arrival_us = 0;
+    _motor_auto_land_last_arrived_us = 0;
+    _motor_land_hold_n_m = 0.0;
+    _motor_land_hold_e_m = 0.0;
+    _motor_sim_agl_ground_count = 0;
+    _mixing_interface_esc.setMitigationEnabled(_attack_mitigation_enabled);
+
     if (_attack_mitigation_enabled) {
         PX4_WARN("\n[Mitigation] KF-Jamming mitigation ENABLED\n");
     } else {
@@ -1723,6 +1735,11 @@ void GZBridge::imuCallback(const gz::msgs::IMU &msg)
     checkImuAutoDisarm(timestamp);
     // ======== MITIGACAO DE POUSO IMU - FIM ========
 
+    // ======== MITIGACAO DE POUSO MOTOR - INICIO ========
+    checkMotorAutoLand(timestamp);
+    checkMotorAutoDisarm(timestamp);
+    // ======== MITIGACAO DE POUSO MOTOR - FIM ========
+
 }
 
 // ======== MITIGACAO DE POUSO GPS - INICIO ========
@@ -2470,6 +2487,251 @@ void GZBridge::publishImuDisarmCommand(uint64_t timestamp, bool force_disarm)
         force_disarm ? "Forced" : "Normal");
 }
 // ======== MITIGACAO DE POUSO IMU - FIM ========
+
+// ======== MITIGACAO DE POUSO MOTOR - INICIO ========
+// Controla o pouso quando a mitigacao de motor esta ativa e uma anomalia de
+// atuacao foi confirmada (ver GZMixingInterfaceESC::updateOutputs, que ja
+// corrige o comando em tempo real; aqui so decide sobre o pouso). Mesma
+// logica de chegada ao destino das demais mitigacoes.
+void GZBridge::checkMotorAutoLand(uint64_t timestamp)
+{
+    if (!_attack_mitigation_enabled || !_mixing_interface_esc.motorAnomalyActive() ||
+            _motor_auto_land_sent || !_pos_ref.isInitialized()) {
+        _motor_auto_land_arrival_us = 0;
+        _motor_auto_land_last_arrived_us = 0;
+        return;
+    }
+
+    if (!_lpos_xy_valid || (timestamp - _lpos_timestamp) > 500000ULL) {
+        _motor_auto_land_arrival_us = 0;
+        _motor_auto_land_last_arrived_us = 0;
+        return;
+    }
+
+    position_setpoint_triplet_s triplet{};
+
+    if (!_pos_sp_triplet_sub.copy(&triplet) || !triplet.current.valid ||
+            !PX4_ISFINITE(triplet.current.lat) || !PX4_ISFINITE(triplet.current.lon)) {
+        _motor_auto_land_arrival_us = 0;
+        _motor_auto_land_last_arrived_us = 0;
+        return;
+    }
+
+    float dest_n_m = 0.0f;
+    float dest_e_m = 0.0f;
+    _pos_ref.project(triplet.current.lat, triplet.current.lon, dest_n_m, dest_e_m);
+
+    const double dn = _lpos_n_m - static_cast<double>(dest_n_m);
+    const double de = _lpos_e_m - static_cast<double>(dest_e_m);
+    const float horizontal_error = static_cast<float>(sqrt(dn * dn + de * de));
+
+    const bool arrived =
+        (horizontal_error <= AUTO_LAND_ANOMALY_DEST_RADIUS_M) &&
+        (_lpos_ground_speed <= AUTO_LAND_ANOMALY_MAX_SPEED_M_S);
+
+    if (!arrived) {
+        _motor_auto_land_arrival_us = 0;
+        _motor_auto_land_last_arrived_us = 0;
+        return;
+    }
+
+    _motor_auto_land_last_arrived_us = timestamp;
+
+    if (_motor_auto_land_arrival_us == 0) {
+        _motor_auto_land_arrival_us = timestamp;
+
+        _motor_land_hold_n_m = _lpos_n_m;
+        _motor_land_hold_e_m = _lpos_e_m;
+
+        PX4_INFO("\n[Motor-Land] Destination reached | err_xy=%.1f m | vel=%.2f m/s | window=%.1f s\n",
+            static_cast<double>(horizontal_error),
+            static_cast<double>(_lpos_ground_speed),
+            static_cast<double>(AUTO_LAND_STABLE_US) / 1e6);
+
+        return;
+    }
+
+    const uint64_t preland_elapsed_us = timestamp - _motor_auto_land_arrival_us;
+
+    if (preland_elapsed_us < AUTO_LAND_STABLE_US) {
+        return;
+    }
+
+    _motor_landing_active = true;
+    _motor_auto_land_sent = true;
+
+    publishMotorLandCommand(timestamp);
+}
+
+// Envia comando de desarme assim que o detector de pouso do PX4 (ou, em ultimo
+// caso, os sensores de ground-truth do Gazebo usados apenas para confirmar o
+// solo) indicar contato com o solo. A anomalia de motor em si nunca e usada
+// como criterio aqui.
+void GZBridge::checkMotorAutoDisarm(uint64_t timestamp)
+{
+    if (!_motor_landing_active || !_motor_auto_land_sent || _motor_auto_disarm_sent) {
+        return;
+    }
+
+    vehicle_land_detected_s land_detected{};
+    const bool land_detector_available = _vehicle_land_detected_sub.copy(&land_detected);
+
+    const bool land_detector_recent =
+        land_detector_available &&
+        (land_detected.timestamp > 0) &&
+        (timestamp >= land_detected.timestamp) &&
+        ((timestamp - land_detected.timestamp) <= AUTO_LAND_GROUND_SENSOR_TIMEOUT_US);
+
+    const bool ground_contact_by_px4_landed =
+        land_detector_recent && land_detected.landed;
+
+    const bool ground_contact_by_px4_early =
+        land_detector_recent &&
+        (land_detected.ground_contact || land_detected.maybe_landed);
+
+    const bool ground_sensor_recent =
+        _ground_distance_valid &&
+        ((timestamp - _ground_distance_timestamp) <= AUTO_LAND_GROUND_SENSOR_TIMEOUT_US);
+
+    const bool ground_contact_by_sensor =
+        ground_sensor_recent &&
+        PX4_ISFINITE(_ground_distance_m) &&
+        (_ground_distance_m <= AUTO_LAND_GROUND_DISARM_DIST_M);
+
+    // Ground-truth do Gazebo, usado exclusivamente para confirmar contato com
+    // o solo durante o pouso, nunca para detectar a anomalia de motor.
+    const bool sim_ground_recent =
+        _sim_agl_valid &&
+        (timestamp >= _sim_agl_timestamp) &&
+        ((timestamp - _sim_agl_timestamp) <= AUTO_LAND_GROUND_SENSOR_TIMEOUT_US) &&
+        PX4_ISFINITE(_sim_agl_m);
+
+    if (sim_ground_recent) {
+        if (_sim_agl_m <= AUTO_LAND_SIM_GROUND_DISARM_AGL_M) {
+            _motor_sim_agl_ground_count++;
+        } else {
+            _motor_sim_agl_ground_count = 0;
+        }
+    } else {
+        _motor_sim_agl_ground_count = 0;
+    }
+
+    const bool ground_contact_by_sim_agl =
+        sim_ground_recent &&
+        (_sim_agl_m <= AUTO_LAND_SIM_GROUND_DISARM_AGL_M) &&
+        (_motor_sim_agl_ground_count >= SIM_AGL_GROUND_CONFIRM_COUNT);
+
+    if (!ground_contact_by_px4_landed &&
+            !ground_contact_by_px4_early &&
+            !ground_contact_by_sensor &&
+            !ground_contact_by_sim_agl) {
+        return;
+    }
+
+    const bool force_disarm = !ground_contact_by_px4_landed;
+
+    const bool disarm_att_recent =
+        _sim_att_valid &&
+        (timestamp >= _sim_att_timestamp) &&
+        ((timestamp - _sim_att_timestamp) <= 500000ULL);
+
+    const bool forced_disarm_speed_ok = (_lpos_ground_speed <= 0.15f);
+
+    const bool forced_disarm_att_ok =
+        !disarm_att_recent ||
+        ((fabsf(_sim_roll_rad) <= AUTO_LAND_MAX_ROLL_RAD) &&
+        (fabsf(_sim_pitch_rad) <= AUTO_LAND_MAX_PITCH_RAD));
+
+    if (force_disarm && (!forced_disarm_speed_ok || !forced_disarm_att_ok)) {
+        return;
+    }
+
+    if (ground_contact_by_px4_landed) {
+        PX4_WARN("\n[Motor-Land] PX4 landing detector confirmed landed - normal disarm\n");
+
+    } else if (ground_contact_by_px4_early) {
+        PX4_WARN("\n[Motor-Land] PX4 landing detector reported ground contact - safety disarm\n");
+
+    } else if (ground_contact_by_sensor) {
+        PX4_WARN("\n[Motor-Land] Downward distance sensor reported ground contact | dist=%.2f m - safety disarm\n",
+            static_cast<double>(_ground_distance_m));
+
+    } else {
+        PX4_WARN("\n[Motor-Land] Simulated ground proximity reached | agl=%.2f m - safety disarm\n",
+            static_cast<double>(_sim_agl_m));
+    }
+
+    publishMotorDisarmCommand(timestamp, force_disarm);
+    _motor_auto_disarm_sent = true;
+    _motor_auto_land_sent = true;
+    _motor_landing_active = false;
+}
+
+// Envia LAND com coordenada global explicita no ponto de chegada (posicao
+// fixa; a descida vertical fica sob controle do modo LAND do PX4).
+void GZBridge::publishMotorLandCommand(uint64_t timestamp)
+{
+    double land_lat = 0.0;
+    double land_lon = 0.0;
+    _pos_ref.reproject(
+        static_cast<float>(_motor_land_hold_n_m),
+        static_cast<float>(_motor_land_hold_e_m),
+        land_lat,
+        land_lon);
+
+    vehicle_command_s cmd{};
+    cmd.timestamp = timestamp;
+    cmd.param1 = 0.0f;
+    cmd.param2 = 0.0f;
+    cmd.param3 = 0.0f;
+    cmd.param4 = NAN;
+    cmd.param5 = static_cast<float>(land_lat);
+    cmd.param6 = static_cast<float>(land_lon);
+    cmd.param7 = NAN;
+
+    cmd.command = vehicle_command_s::VEHICLE_CMD_NAV_LAND;
+    cmd.target_system = 1;
+    cmd.target_component = 1;
+    cmd.source_system = 1;
+    cmd.source_component = 1;
+    cmd.confirmation = 0;
+    cmd.from_external = false;
+
+    _vehicle_command_pub.publish(cmd);
+
+    PX4_WARN("\n[Motor-Land] Controlled landing started | hold N=%.1f E=%.1f | lat=%.7f lon=%.7f\n",
+        _motor_land_hold_n_m,
+        _motor_land_hold_e_m,
+        land_lat,
+        land_lon);
+}
+
+// Envia o comando de desarme do PX4 apos confirmacao de contato com o solo.
+void GZBridge::publishMotorDisarmCommand(uint64_t timestamp, bool force_disarm)
+{
+    vehicle_command_s cmd{};
+    cmd.timestamp = timestamp;
+    cmd.param1 = 0.0f;
+    cmd.param2 = force_disarm ? 21196.0f : 0.0f;
+    cmd.param3 = 0.0f;
+    cmd.param4 = 0.0f;
+    cmd.param5 = 0.0f;
+    cmd.param6 = 0.0f;
+    cmd.param7 = 0.0f;
+    cmd.command = vehicle_command_s::VEHICLE_CMD_COMPONENT_ARM_DISARM;
+    cmd.target_system = 1;
+    cmd.target_component = 1;
+    cmd.source_system = 1;
+    cmd.source_component = 1;
+    cmd.confirmation = 0;
+    cmd.from_external = false;
+
+    _vehicle_command_pub.publish(cmd);
+
+    PX4_WARN("\n[Motor-Land] %s disarm command sent after ground contact confirmation.\n",
+        force_disarm ? "Forced" : "Normal");
+}
+// ======== MITIGACAO DE POUSO MOTOR - FIM ========
 
 // ======== MITIGACAO BLACKOUT GPS - INICIO ========
 // Publica uma pseudo-medicao GPS durante blackout usando VIO quando disponivel

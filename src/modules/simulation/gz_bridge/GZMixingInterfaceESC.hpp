@@ -39,7 +39,12 @@
 #include <gz/transport.hh>
 
 #include <uORB/PublicationMulti.hpp>
+#include <uORB/Subscription.hpp>
 #include <uORB/topics/esc_status.h>
+#include <uORB/topics/actuator_armed.h>
+#include <uORB/topics/vehicle_land_detected.h>
+
+#include <atomic>
 
 
 // GZBridge mixing class for ESCs.
@@ -75,6 +80,23 @@ public:
 	}
 	// ============================
 
+	// ====== MITIGACAO MOTOR ======
+	// Habilita/desabilita a mitigacao. Chamado pelo GZBridge a partir do mesmo
+	// topico unico de mitigacao usado por GPS e IMU.
+	void setMitigationEnabled(bool enabled) {
+		_motor_mitigation_enabled = enabled;
+		_motor_anomaly_active.store(false);
+		_motor_anomaly_start_us = 0;
+		_motor_recovery_start_us = 0;
+	}
+
+	// Consultado pelo GZBridge (thread diferente) para acionar o pouso
+	// automatico quando uma anomalia de atuacao esta confirmada.
+	bool motorAnomalyActive() const {
+		return _motor_anomaly_active.load(std::memory_order_relaxed);
+	}
+	// ==============================
+
 private:
 	friend class GZBridge;
 
@@ -90,6 +112,31 @@ private:
 	int _motor_attack_index{0};
 	double _motor_attack_speed{0.0};
 	// ===============================
+
+	// ====== MITIGACAO MOTOR - ESTADO ======
+	bool _motor_mitigation_enabled{false};
+
+	uORB::Subscription _actuator_armed_sub{ORB_ID(actuator_armed)};
+	uORB::Subscription _vehicle_land_detected_sub{ORB_ID(vehicle_land_detected)};
+
+	// Lido pelo GZBridge em outra work queue/thread.
+	std::atomic<bool> _motor_anomaly_active{false};
+	uint64_t _motor_anomaly_start_us{0};
+	uint64_t _motor_recovery_start_us{0};
+
+	// Abaixo deste valor de saida (na mesma unidade de _motor_attack_speed,
+	// faixa 0-1450), o motor e considerado "sem empuxo relevante".
+	static constexpr float MOTOR_MIN_ARMED_OUTPUT = 50.0f;
+	// Desvio maximo tolerado entre a saida de um motor e a media dos demais,
+	// como fracao da propria media.
+	static constexpr float MOTOR_ASYMMETRY_FRACTION = 0.20f; // 20%
+	// Piso absoluto para a media nao gerar um limiar irrisorio perto do solo.
+	static constexpr float MOTOR_ASYMMETRY_MIN_ABS = 60.0f;
+	// Tempo minimo sustentado para confirmar a anomalia/recuperacao antes de
+	// sinalizar ao GZBridge (o bloqueio do comando em si e imediato, sem essa espera).
+	static constexpr uint64_t MOTOR_ANOMALY_CONFIRM_US = 100000ULL;  // 100 ms
+	static constexpr uint64_t MOTOR_RECOVERY_CONFIRM_US = 300000ULL; // 300 ms
+	// ========================================
 
 	MixingOutput _mixing_output{"SIM_GZ_EC", MAX_ACTUATORS, *this, MixingOutput::SchedulingPolicy::Auto, false, false};
 

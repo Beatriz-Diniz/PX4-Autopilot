@@ -173,6 +173,15 @@ private:
     void publishImuLandCommand(uint64_t timestamp);
     void publishImuDisarmCommand(uint64_t timestamp, bool force_disarm);
 
+    // Pouso/desarme para a mitigacao de motor. O gatilho vem da anomalia de
+    // atuacao detectada e ja corrigida em GZMixingInterfaceESC::updateOutputs
+    // (consultada via _mixing_interface_esc.motorAnomalyActive()); mesma logica
+    // de chegada ao destino das demais mitigacoes.
+    void checkMotorAutoLand(uint64_t timestamp);
+    void checkMotorAutoDisarm(uint64_t timestamp);
+    void publishMotorLandCommand(uint64_t timestamp);
+    void publishMotorDisarmCommand(uint64_t timestamp, bool force_disarm);
+
     static void rotateQuaternion(gz::math::Quaterniond &q_FRD_to_NED, const gz::math::Quaterniond q_FLU_to_ENU);
 
     static float generate_wgn();
@@ -316,6 +325,20 @@ private:
     // Idade maxima aceita para o substituto de VIO antes de ser considerado obsoleto.
     static constexpr uint64_t IMU_VIO_SUBSTITUTE_MAX_AGE_US = 400000ULL; // 400 ms
     // ======== MITIGACAO IMU - FIM ========
+
+    // ======== MITIGACAO MOTOR - ESTADO ========
+    // A deteccao e a correcao em tempo real do comando de motor acontecem em
+    // GZMixingInterfaceESC::updateOutputs (thread separada). Aqui so fica o
+    // estado do pouso/desarme, disparado ao consultar motorAnomalyActive().
+    bool     _motor_landing_active{false};
+    bool     _motor_auto_land_sent{false};
+    bool     _motor_auto_disarm_sent{false};
+    uint64_t _motor_auto_land_arrival_us{0};
+    uint64_t _motor_auto_land_last_arrived_us{0};
+    double   _motor_land_hold_n_m{0.0};
+    double   _motor_land_hold_e_m{0.0};
+    uint32_t _motor_sim_agl_ground_count{0};
+    // ======== MITIGACAO MOTOR - FIM ========
 
     // Ataque de magnetometro
     int _mag_attack_option{0};
