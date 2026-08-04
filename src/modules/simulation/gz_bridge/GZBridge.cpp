@@ -718,6 +718,8 @@ void GZBridge::attackMitigationCallback(const gz::msgs::Vector3d &msg)
     _imu_anomaly_start_us = 0;
     _imu_recovery_start_us = 0;
     _imu_ever_armed = false;
+    _imu_prev_armed = false;
+    _imu_land_settle_until_us = 0;
 
     _imu_ref_gps_prev_valid = false;
     _imu_ref_gps_prev_us = 0;
@@ -753,6 +755,25 @@ void GZBridge::attackMitigationCallback(const gz::msgs::Vector3d &msg)
     _motor_land_hold_e_m = 0.0;
     _motor_sim_agl_ground_count = 0;
     _mixing_interface_esc.setMitigationEnabled(_attack_mitigation_enabled);
+
+    // Reinicia o estado da mitigacao de magnetometro (deteccao, linha de
+    // base, pouso).
+    _mag_ever_armed = false;
+    _mag_baseline_initialized = false;
+    _mag_baseline_warmup_count = 0;
+    _mag_heading_offset_rad = 0.0;
+    _mag_anomaly_active = false;
+    _mag_anomaly_start_us = 0;
+    _mag_recovery_start_us = 0;
+    _mag_mitig_diag_count = 0;
+    _mag_landing_active = false;
+    _mag_auto_land_sent = false;
+    _mag_auto_disarm_sent = false;
+    _mag_auto_land_arrival_us = 0;
+    _mag_auto_land_last_arrived_us = 0;
+    _mag_land_hold_n_m = 0.0;
+    _mag_land_hold_e_m = 0.0;
+    _mag_sim_agl_ground_count = 0;
 
     if (_attack_mitigation_enabled) {
         PX4_WARN("\n[Mitigation] KF-Jamming mitigation ENABLED\n");
@@ -851,6 +872,187 @@ void GZBridge::magnetometerCallback(const gz::msgs::Magnetometer &msg)
         break;
     }
     // ======== ATAQUE MAGNETOMETRO - FIM ========
+
+    // ======== MITIGACAO MAGNETOMETRO - INICIO ========
+    // Deteccao de anomalia no sinal publicado do sensor, sem consultar
+    // _mag_attack_option:
+    //  (a) magnitude do campo horizontal fora de uma faixa fisica plausivel;
+    //  (b) heading implicito no magnetometro divergindo do heading da VIO
+    //      (referencia independente) em relacao a um offset calibrado a
+    //      partir das primeiras amostras saudaveis e adaptado lentamente depois.
+    // So confia no calculo de heading quando o veiculo esta proximo do
+    // nivelado (roll/pitch da VIO abaixo de MAG_MAX_TILT_RAD): a convencao de
+    // eixos do magnetometro simulado nao e garantida como a mesma FRD usada
+    // por accel/gyro, entao nao arriscamos compensar inclinacao via rotacao.
+    actuator_armed_s mag_actuator_armed{};
+    const bool mag_armed_available = _actuator_armed_sub.copy(&mag_actuator_armed);
+    const bool mag_vehicle_armed = mag_armed_available && mag_actuator_armed.armed;
+
+    vehicle_land_detected_s mag_land_detected{};
+    const bool mag_land_detector_available = _vehicle_land_detected_sub.copy(&mag_land_detected);
+    const bool mag_vehicle_not_landed = mag_land_detector_available && !mag_land_detected.landed;
+
+    if (mag_vehicle_armed && mag_vehicle_not_landed) {
+        _mag_ever_armed = true;
+    }
+
+    if (_attack_mitigation_enabled && _mag_ever_armed) {
+
+        const double horiz_mag = sqrt(
+            static_cast<double>(report.x) * static_cast<double>(report.x) +
+            static_cast<double>(report.y) * static_cast<double>(report.y));
+
+        const bool horiz_out_of_bounds =
+            !PX4_ISFINITE(horiz_mag) ||
+            (horiz_mag < MAG_FIELD_HORIZ_MIN_G) ||
+            (horiz_mag > MAG_FIELD_HORIZ_MAX_G);
+
+        const bool vio_att_recent =
+            _vio_heading_valid &&
+            (timestamp >= _vio_heading_us) &&
+            ((timestamp - _vio_heading_us) <= MAG_VIO_MAX_AGE_US);
+
+        const bool vio_near_level =
+            vio_att_recent &&
+            (fabsf(_vio_roll_rad) < MAG_MAX_TILT_RAD) &&
+            (fabsf(_vio_pitch_rad) < MAG_MAX_TILT_RAD);
+
+        const bool heading_ref_valid = vio_near_level && (horiz_mag > 1e-9);
+
+        double mag_heading = 0.0;
+        double offset = 0.0;
+        double heading_residual = 0.0;
+        bool heading_anomaly = false;
+
+        if (heading_ref_valid) {
+            mag_heading = atan2(static_cast<double>(report.y), static_cast<double>(report.x));
+
+            // A relacao real entre o heading implicito no magnetometro e o
+            // heading da VIO e uma reflexao (mag_heading ~= -vio_heading + c),
+            // nao uma simples rotacao (mag_heading ~= vio_heading + c). Isso
+            // vem do mapeamento de eixos do magnetometro simulado, que tem
+            // determinante -1 (troca e inverte os dois eixos horizontais).
+            offset = atan2(sin(mag_heading + static_cast<double>(_vio_heading_rad)),
+                     cos(mag_heading + static_cast<double>(_vio_heading_rad)));
+
+            if (_mag_baseline_initialized) {
+                heading_residual = atan2(sin(offset - _mag_heading_offset_rad), cos(offset - _mag_heading_offset_rad));
+                heading_anomaly = fabs(heading_residual) > MAG_HEADING_ERROR_THRESHOLD_RAD;
+            }
+        }
+
+        const bool sample_anomalous = horiz_out_of_bounds || heading_anomaly;
+
+        // Severo (confirmacao rapida) somente para violacao fisica dura. Um
+        // desacordo de heading, por maior que seja, pode vir de interferencia
+        // magnetica transitoria durante manobra (curva com tracao diferencial
+        // entre motores), entao sempre passa pela janela de confirmacao longa
+        // (MAG_ANOMALY_CONFIRM_US) em vez do caminho rapido.
+        const bool sample_severe = horiz_out_of_bounds;
+
+        if (!sample_anomalous) {
+
+            // Atualiza a linha de base apenas com amostras saudaveis. As
+            // primeiras amostras (warmup) calibram o offset com um alpha mais
+            // agressivo, para nao travar numa unica amostra ruidosa logo no
+            // inicio do voo real; depois disso, adapta lentamente (tolera
+            // deriva legitima do sensor, mas um ataque sustentado nao chega a
+            // ser absorvido, pois so entra aqui quando a amostra nao e anomala).
+            if (heading_ref_valid) {
+                if (_mag_baseline_warmup_count == 0) {
+                    _mag_heading_offset_rad = offset;
+                    _mag_baseline_warmup_count = 1;
+
+                } else if (_mag_baseline_warmup_count < MAG_BASELINE_WARMUP_SAMPLES) {
+                    const double delta = atan2(sin(offset - _mag_heading_offset_rad), cos(offset - _mag_heading_offset_rad));
+                    _mag_heading_offset_rad = atan2(
+                        sin(_mag_heading_offset_rad + MAG_BASELINE_WARMUP_ALPHA * delta),
+                        cos(_mag_heading_offset_rad + MAG_BASELINE_WARMUP_ALPHA * delta));
+                    _mag_baseline_warmup_count++;
+
+                    if (_mag_baseline_warmup_count >= MAG_BASELINE_WARMUP_SAMPLES) {
+                        _mag_baseline_initialized = true;
+                    }
+
+                } else {
+                    const double delta = atan2(sin(offset - _mag_heading_offset_rad), cos(offset - _mag_heading_offset_rad));
+                    _mag_heading_offset_rad = atan2(
+                        sin(_mag_heading_offset_rad + MAG_BASELINE_ALPHA * delta),
+                        cos(_mag_heading_offset_rad + MAG_BASELINE_ALPHA * delta));
+                }
+            }
+
+            if (_mag_anomaly_active) {
+                if (_mag_recovery_start_us == 0) {
+                    _mag_recovery_start_us = timestamp;
+
+                } else if ((timestamp - _mag_recovery_start_us) >= MAG_RECOVERY_CONFIRM_US) {
+                    _mag_anomaly_active = false;
+                    _mag_anomaly_start_us = 0;
+                    _mag_mitig_diag_count = 0;
+
+                    PX4_INFO("\n[Mag-Mitig] Sensor anomaly cleared\n");
+                }
+            }
+
+        } else {
+            _mag_recovery_start_us = 0;
+
+            if (_mag_anomaly_start_us == 0) {
+                _mag_anomaly_start_us = timestamp;
+            }
+
+            const uint64_t mag_confirm_required_us =
+                sample_severe ? MAG_ANOMALY_CONFIRM_SEVERE_US : MAG_ANOMALY_CONFIRM_US;
+
+            if (!_mag_anomaly_active &&
+                    ((timestamp - _mag_anomaly_start_us) >= mag_confirm_required_us)) {
+                _mag_anomaly_active = true;
+
+                PX4_WARN("\n[Mag-Mitig] Sensor anomaly detected | heading_residual=%.1f deg | mag_heading=%.1f deg | vio_heading=%.1f deg | offset=%.1f deg | baseline=%.1f deg | bounds=%s\n",
+                    math::degrees(heading_residual),
+                    math::degrees(mag_heading),
+                    static_cast<double>(math::degrees(_vio_heading_rad)),
+                    math::degrees(offset),
+                    math::degrees(_mag_heading_offset_rad),
+                    horiz_out_of_bounds ? "out" : "ok");
+
+                PX4_INFO("\n[Mag-Mitig] Run 'listener vehicle_magnetometer' to check the corrected reading.\n");
+            }
+
+            // Reconstroi a direcao a partir do heading esperado (reflexao do
+            // heading da VIO mais o offset calibrado, mesmo modelo da
+            // deteccao), preservando a magnitude horizontal ainda confiavel
+            // do proprio sinal atacado. So roda quando a ultima referencia de
+            // heading valida foi calculada em voo nivelado (heading_ref_valid
+            // so fica true nessas condicoes).
+            if (_mag_anomaly_active && heading_ref_valid) {
+                const double expected_heading = atan2(
+                    sin(_mag_heading_offset_rad - static_cast<double>(_vio_heading_rad)),
+                    cos(_mag_heading_offset_rad - static_cast<double>(_vio_heading_rad)));
+
+                report.x = static_cast<float>(horiz_mag * cos(expected_heading));
+                report.y = static_cast<float>(horiz_mag * sin(expected_heading));
+            }
+
+            if (_mag_anomaly_active && (_mag_mitig_diag_count < MAG_MITIG_DIAG_MAX_COUNT)) {
+                static uint64_t mag_mitig_diag_last_us = 0;
+
+                if ((timestamp - mag_mitig_diag_last_us) > 1000000ULL) {
+                    mag_mitig_diag_last_us = timestamp;
+                    _mag_mitig_diag_count++;
+
+                    PX4_INFO("\n[Mag-Mitig] Status | heading_residual=%.1f deg | mag_heading=%.1f deg | vio_heading=%.1f deg | horiz_mag=%.2e G | vio_age=%.0f ms\n",
+                        math::degrees(heading_residual),
+                        math::degrees(mag_heading),
+                        static_cast<double>(math::degrees(_vio_heading_rad)),
+                        horiz_mag,
+                        _vio_heading_valid ? static_cast<double>(timestamp - _vio_heading_us) / 1000.0 : -1.0);
+                }
+            }
+        }
+    }
+    // ======== MITIGACAO MAGNETOMETRO - FIM ========
 
     _sensor_mag_pub.publish(report);
 }
@@ -1028,7 +1230,17 @@ void GZBridge::imuCallback(const gz::msgs::IMU &msg)
         _imu_ever_armed = true;
     }
 
-    if (_attack_mitigation_enabled && _imu_ever_armed) {
+    // Suspende a deteccao por uma janela curta na transicao de armado para
+    // desarmado: o corte do empuxo pode gerar uma leitura transitoria de
+    // forca especifica proxima de zero, fisicamente identica a uma IMU
+    // zerada, sem relacao com ataque.
+    if (!imu_vehicle_armed && _imu_prev_armed) {
+        _imu_land_settle_until_us = timestamp + IMU_LAND_SETTLE_US;
+    }
+
+    _imu_prev_armed = imu_vehicle_armed;
+
+    if (_attack_mitigation_enabled && _imu_ever_armed && (timestamp >= _imu_land_settle_until_us)) {
 
         const double accel_x_d = static_cast<double>(accel.x);
         const double accel_y_d = static_cast<double>(accel.y);
@@ -1144,8 +1356,6 @@ void GZBridge::imuCallback(const gz::msgs::IMU &msg)
                 _imu_gyro_norm_var_ewma  = math::constrain(_imu_gyro_norm_var_ewma, 0.02, 2.0);
             }
 
-            _imu_recovery_start_us = 0;
-
             if (_imu_anomaly_active) {
                 // Confirma recuperacao apos um intervalo estavel sem anomalia.
                 if (_imu_recovery_start_us == 0) {
@@ -1187,7 +1397,13 @@ void GZBridge::imuCallback(const gz::msgs::IMU &msg)
 
             // Substitui accel/gyro pelo substituto dinamico reconstruido a
             // partir da VIO (ver bloco de reconstrucao em odometryCallback).
-            if (_imu_anomaly_active) {
+            // Uma amostra severa (violacao fisica dura ou z-score muito acima
+            // do normal) e substituida imediatamente, mesmo antes da anomalia
+            // ser oficialmente confirmada: isso evita que qualquer amostra
+            // obviamente atacada chegue crua ao EKF do PX4 durante a janela
+            // de confirmacao. A confirmacao oficial (log/pouso) continua
+            // exigindo a janela de debounce normalmente.
+            if (_imu_anomaly_active || sample_severe) {
                 const bool vio_accel_recent =
                     _vio_imu_accel_valid &&
                     (timestamp >= _vio_imu_accel_us) &&
@@ -1199,15 +1415,15 @@ void GZBridge::imuCallback(const gz::msgs::IMU &msg)
                     ((timestamp - _vio_imu_gyro_us) <= IMU_VIO_SUBSTITUTE_MAX_AGE_US);
 
                 if (vio_accel_recent) {
-                    accel.x = _vio_imu_accel_body[0];
-                    accel.y = _vio_imu_accel_body[1];
-                    accel.z = _vio_imu_accel_body[2];
+                    accel.x = _vio_imu_accel_body[0] + generate_wgn() * IMU_VIO_SUBSTITUTE_ACCEL_NOISE_STD;
+                    accel.y = _vio_imu_accel_body[1] + generate_wgn() * IMU_VIO_SUBSTITUTE_ACCEL_NOISE_STD;
+                    accel.z = _vio_imu_accel_body[2] + generate_wgn() * IMU_VIO_SUBSTITUTE_ACCEL_NOISE_STD;
                 }
 
                 if (vio_gyro_recent) {
-                    gyro.x = _vio_imu_gyro_body[0];
-                    gyro.y = _vio_imu_gyro_body[1];
-                    gyro.z = _vio_imu_gyro_body[2];
+                    gyro.x = _vio_imu_gyro_body[0] + generate_wgn() * IMU_VIO_SUBSTITUTE_GYRO_NOISE_STD;
+                    gyro.y = _vio_imu_gyro_body[1] + generate_wgn() * IMU_VIO_SUBSTITUTE_GYRO_NOISE_STD;
+                    gyro.z = _vio_imu_gyro_body[2] + generate_wgn() * IMU_VIO_SUBSTITUTE_GYRO_NOISE_STD;
                 }
 
                 static uint64_t vio_substitute_log_last_us = 0;
@@ -1740,6 +1956,11 @@ void GZBridge::imuCallback(const gz::msgs::IMU &msg)
     checkMotorAutoDisarm(timestamp);
     // ======== MITIGACAO DE POUSO MOTOR - FIM ========
 
+    // ======== MITIGACAO DE POUSO MAGNETOMETRO - INICIO ========
+    checkMagAutoLand(timestamp);
+    checkMagAutoDisarm(timestamp);
+    // ======== MITIGACAO DE POUSO MAGNETOMETRO - FIM ========
+
 }
 
 // ======== MITIGACAO DE POUSO GPS - INICIO ========
@@ -2245,22 +2466,32 @@ void GZBridge::publishGpsDisarmCommand(uint64_t timestamp, bool force_disarm)
 }
 // ======== MITIGACAO DE POUSO GPS - FIM ========
 
-// ======== MITIGACAO DE POUSO IMU - INICIO ========
-// Controla o pouso quando a mitigacao de IMU esta ativa e uma anomalia foi confirmada.
-// Reaproveita a mesma logica de chegada ao destino da mitigacao GPS (raio/velocidade/
-// janela de estabilidade), mas a origem do gatilho e a anomalia detectada no sinal IMU.
-void GZBridge::checkImuAutoLand(uint64_t timestamp)
+// ======== MITIGACAO DE POUSO GENERICA (IMU/MOTOR/MAGNETOMETRO) - INICIO ========
+// Molde comum de pouso/desarme reaproveitado por IMU, motor e magnetometro:
+// cada uma dessas mitigacoes tem uma unica fonte de anomalia e uma unica
+// fonte de posicao confiavel (_lpos_*). GPS mantem implementacao propria por
+// ter duas origens distintas (blackout e anomalia por ruido).
+void GZBridge::checkGenericAnomalyAutoLand(
+    uint64_t timestamp,
+    bool anomaly_active,
+    bool &landing_active,
+    bool &auto_land_sent,
+    uint64_t &auto_land_arrival_us,
+    uint64_t &auto_land_last_arrived_us,
+    double &land_hold_n_m,
+    double &land_hold_e_m,
+    const char *log_tag)
 {
-    if (!_attack_mitigation_enabled || !_imu_anomaly_active ||
-            _imu_auto_land_sent || !_pos_ref.isInitialized()) {
-        _imu_auto_land_arrival_us = 0;
-        _imu_auto_land_last_arrived_us = 0;
+    if (!_attack_mitigation_enabled || !anomaly_active ||
+            auto_land_sent || !_pos_ref.isInitialized()) {
+        auto_land_arrival_us = 0;
+        auto_land_last_arrived_us = 0;
         return;
     }
 
     if (!_lpos_xy_valid || (timestamp - _lpos_timestamp) > 500000ULL) {
-        _imu_auto_land_arrival_us = 0;
-        _imu_auto_land_last_arrived_us = 0;
+        auto_land_arrival_us = 0;
+        auto_land_last_arrived_us = 0;
         return;
     }
 
@@ -2268,8 +2499,8 @@ void GZBridge::checkImuAutoLand(uint64_t timestamp)
 
     if (!_pos_sp_triplet_sub.copy(&triplet) || !triplet.current.valid ||
             !PX4_ISFINITE(triplet.current.lat) || !PX4_ISFINITE(triplet.current.lon)) {
-        _imu_auto_land_arrival_us = 0;
-        _imu_auto_land_last_arrived_us = 0;
+        auto_land_arrival_us = 0;
+        auto_land_last_arrived_us = 0;
         return;
     }
 
@@ -2286,20 +2517,21 @@ void GZBridge::checkImuAutoLand(uint64_t timestamp)
         (_lpos_ground_speed <= AUTO_LAND_ANOMALY_MAX_SPEED_M_S);
 
     if (!arrived) {
-        _imu_auto_land_arrival_us = 0;
-        _imu_auto_land_last_arrived_us = 0;
+        auto_land_arrival_us = 0;
+        auto_land_last_arrived_us = 0;
         return;
     }
 
-    _imu_auto_land_last_arrived_us = timestamp;
+    auto_land_last_arrived_us = timestamp;
 
-    if (_imu_auto_land_arrival_us == 0) {
-        _imu_auto_land_arrival_us = timestamp;
+    if (auto_land_arrival_us == 0) {
+        auto_land_arrival_us = timestamp;
 
-        _imu_land_hold_n_m = _lpos_n_m;
-        _imu_land_hold_e_m = _lpos_e_m;
+        land_hold_n_m = _lpos_n_m;
+        land_hold_e_m = _lpos_e_m;
 
-        PX4_INFO("\n[IMU-Land] Destination reached | err_xy=%.1f m | vel=%.2f m/s | window=%.1f s\n",
+        PX4_INFO("\n[%s-Land] Destination reached | err_xy=%.1f m | vel=%.2f m/s | window=%.1f s\n",
+            log_tag,
             static_cast<double>(horizontal_error),
             static_cast<double>(_lpos_ground_speed),
             static_cast<double>(AUTO_LAND_STABLE_US) / 1e6);
@@ -2307,269 +2539,31 @@ void GZBridge::checkImuAutoLand(uint64_t timestamp)
         return;
     }
 
-    const uint64_t preland_elapsed_us = timestamp - _imu_auto_land_arrival_us;
+    const uint64_t preland_elapsed_us = timestamp - auto_land_arrival_us;
 
     if (preland_elapsed_us < AUTO_LAND_STABLE_US) {
         return;
     }
 
-    _imu_landing_active = true;
-    _imu_auto_land_sent = true;
+    landing_active = true;
+    auto_land_sent = true;
 
-    publishImuLandCommand(timestamp);
-}
-
-// Envia comando de desarme assim que o detector de pouso do PX4 (ou, em ultimo caso,
-// os sensores de ground-truth do Gazebo usados apenas para confirmar o solo) indicar
-// contato com o solo. A anomalia de IMU em si nunca e usada como criterio aqui.
-void GZBridge::checkImuAutoDisarm(uint64_t timestamp)
-{
-    if (!_imu_landing_active || !_imu_auto_land_sent || _imu_auto_disarm_sent) {
-        return;
-    }
-
-    vehicle_land_detected_s land_detected{};
-    const bool land_detector_available = _vehicle_land_detected_sub.copy(&land_detected);
-
-    const bool land_detector_recent =
-        land_detector_available &&
-        (land_detected.timestamp > 0) &&
-        (timestamp >= land_detected.timestamp) &&
-        ((timestamp - land_detected.timestamp) <= AUTO_LAND_GROUND_SENSOR_TIMEOUT_US);
-
-    const bool ground_contact_by_px4_landed =
-        land_detector_recent && land_detected.landed;
-
-    const bool ground_contact_by_px4_early =
-        land_detector_recent &&
-        (land_detected.ground_contact || land_detected.maybe_landed);
-
-    const bool ground_sensor_recent =
-        _ground_distance_valid &&
-        ((timestamp - _ground_distance_timestamp) <= AUTO_LAND_GROUND_SENSOR_TIMEOUT_US);
-
-    const bool ground_contact_by_sensor =
-        ground_sensor_recent &&
-        PX4_ISFINITE(_ground_distance_m) &&
-        (_ground_distance_m <= AUTO_LAND_GROUND_DISARM_DIST_M);
-
-    // Ground-truth do Gazebo (pose do modelo), usado exclusivamente para confirmar
-    // contato com o solo durante o pouso, nunca para detectar a anomalia de IMU.
-    const bool sim_ground_recent =
-        _sim_agl_valid &&
-        (timestamp >= _sim_agl_timestamp) &&
-        ((timestamp - _sim_agl_timestamp) <= AUTO_LAND_GROUND_SENSOR_TIMEOUT_US) &&
-        PX4_ISFINITE(_sim_agl_m);
-
-    if (sim_ground_recent) {
-        if (_sim_agl_m <= AUTO_LAND_SIM_GROUND_DISARM_AGL_M) {
-            _imu_sim_agl_ground_count++;
-        } else {
-            _imu_sim_agl_ground_count = 0;
-        }
-    } else {
-        _imu_sim_agl_ground_count = 0;
-    }
-
-    const bool ground_contact_by_sim_agl =
-        sim_ground_recent &&
-        (_sim_agl_m <= AUTO_LAND_SIM_GROUND_DISARM_AGL_M) &&
-        (_imu_sim_agl_ground_count >= SIM_AGL_GROUND_CONFIRM_COUNT);
-
-    if (!ground_contact_by_px4_landed &&
-            !ground_contact_by_px4_early &&
-            !ground_contact_by_sensor &&
-            !ground_contact_by_sim_agl) {
-        return;
-    }
-
-    const bool force_disarm = !ground_contact_by_px4_landed;
-
-    const bool disarm_att_recent =
-        _sim_att_valid &&
-        (timestamp >= _sim_att_timestamp) &&
-        ((timestamp - _sim_att_timestamp) <= 500000ULL);
-
-    const bool forced_disarm_speed_ok = (_lpos_ground_speed <= 0.15f);
-
-    const bool forced_disarm_att_ok =
-        !disarm_att_recent ||
-        ((fabsf(_sim_roll_rad) <= AUTO_LAND_MAX_ROLL_RAD) &&
-        (fabsf(_sim_pitch_rad) <= AUTO_LAND_MAX_PITCH_RAD));
-
-    if (force_disarm && (!forced_disarm_speed_ok || !forced_disarm_att_ok)) {
-        return;
-    }
-
-    if (ground_contact_by_px4_landed) {
-        PX4_WARN("\n[IMU-Land] PX4 landing detector confirmed landed - normal disarm\n");
-
-    } else if (ground_contact_by_px4_early) {
-        PX4_WARN("\n[IMU-Land] PX4 landing detector reported ground contact - safety disarm\n");
-
-    } else if (ground_contact_by_sensor) {
-        PX4_WARN("\n[IMU-Land] Downward distance sensor reported ground contact | dist=%.2f m - safety disarm\n",
-            static_cast<double>(_ground_distance_m));
-
-    } else {
-        PX4_WARN("\n[IMU-Land] Simulated ground proximity reached | agl=%.2f m - safety disarm\n",
-            static_cast<double>(_sim_agl_m));
-    }
-
-    publishImuDisarmCommand(timestamp, force_disarm);
-    _imu_auto_disarm_sent = true;
-    _imu_auto_land_sent = true;
-    _imu_landing_active = false;
-}
-
-// Envia LAND com coordenada global explicita no ponto de chegada (posicao fixa;
-// a descida vertical fica sob controle do modo LAND do PX4).
-void GZBridge::publishImuLandCommand(uint64_t timestamp)
-{
-    double land_lat = 0.0;
-    double land_lon = 0.0;
-    _pos_ref.reproject(
-        static_cast<float>(_imu_land_hold_n_m),
-        static_cast<float>(_imu_land_hold_e_m),
-        land_lat,
-        land_lon);
-
-    vehicle_command_s cmd{};
-    cmd.timestamp = timestamp;
-    cmd.param1 = 0.0f;
-    cmd.param2 = 0.0f;
-    cmd.param3 = 0.0f;
-    cmd.param4 = NAN;
-    cmd.param5 = static_cast<float>(land_lat);
-    cmd.param6 = static_cast<float>(land_lon);
-    cmd.param7 = NAN;
-
-    cmd.command = vehicle_command_s::VEHICLE_CMD_NAV_LAND;
-    cmd.target_system = 1;
-    cmd.target_component = 1;
-    cmd.source_system = 1;
-    cmd.source_component = 1;
-    cmd.confirmation = 0;
-    cmd.from_external = false;
-
-    _vehicle_command_pub.publish(cmd);
-
-    PX4_WARN("\n[IMU-Land] Controlled landing started | hold N=%.1f E=%.1f | lat=%.7f lon=%.7f\n",
-        _imu_land_hold_n_m,
-        _imu_land_hold_e_m,
-        land_lat,
-        land_lon);
-}
-
-// Envia o comando de desarme do PX4 apos confirmacao de contato com o solo.
-void GZBridge::publishImuDisarmCommand(uint64_t timestamp, bool force_disarm)
-{
-    vehicle_command_s cmd{};
-    cmd.timestamp = timestamp;
-    cmd.param1 = 0.0f;
-    cmd.param2 = force_disarm ? 21196.0f : 0.0f;
-    cmd.param3 = 0.0f;
-    cmd.param4 = 0.0f;
-    cmd.param5 = 0.0f;
-    cmd.param6 = 0.0f;
-    cmd.param7 = 0.0f;
-    cmd.command = vehicle_command_s::VEHICLE_CMD_COMPONENT_ARM_DISARM;
-    cmd.target_system = 1;
-    cmd.target_component = 1;
-    cmd.source_system = 1;
-    cmd.source_component = 1;
-    cmd.confirmation = 0;
-    cmd.from_external = false;
-
-    _vehicle_command_pub.publish(cmd);
-
-    PX4_WARN("\n[IMU-Land] %s disarm command sent after ground contact confirmation.\n",
-        force_disarm ? "Forced" : "Normal");
-}
-// ======== MITIGACAO DE POUSO IMU - FIM ========
-
-// ======== MITIGACAO DE POUSO MOTOR - INICIO ========
-// Controla o pouso quando a mitigacao de motor esta ativa e uma anomalia de
-// atuacao foi confirmada (ver GZMixingInterfaceESC::updateOutputs, que ja
-// corrige o comando em tempo real; aqui so decide sobre o pouso). Mesma
-// logica de chegada ao destino das demais mitigacoes.
-void GZBridge::checkMotorAutoLand(uint64_t timestamp)
-{
-    if (!_attack_mitigation_enabled || !_mixing_interface_esc.motorAnomalyActive() ||
-            _motor_auto_land_sent || !_pos_ref.isInitialized()) {
-        _motor_auto_land_arrival_us = 0;
-        _motor_auto_land_last_arrived_us = 0;
-        return;
-    }
-
-    if (!_lpos_xy_valid || (timestamp - _lpos_timestamp) > 500000ULL) {
-        _motor_auto_land_arrival_us = 0;
-        _motor_auto_land_last_arrived_us = 0;
-        return;
-    }
-
-    position_setpoint_triplet_s triplet{};
-
-    if (!_pos_sp_triplet_sub.copy(&triplet) || !triplet.current.valid ||
-            !PX4_ISFINITE(triplet.current.lat) || !PX4_ISFINITE(triplet.current.lon)) {
-        _motor_auto_land_arrival_us = 0;
-        _motor_auto_land_last_arrived_us = 0;
-        return;
-    }
-
-    float dest_n_m = 0.0f;
-    float dest_e_m = 0.0f;
-    _pos_ref.project(triplet.current.lat, triplet.current.lon, dest_n_m, dest_e_m);
-
-    const double dn = _lpos_n_m - static_cast<double>(dest_n_m);
-    const double de = _lpos_e_m - static_cast<double>(dest_e_m);
-    const float horizontal_error = static_cast<float>(sqrt(dn * dn + de * de));
-
-    const bool arrived =
-        (horizontal_error <= AUTO_LAND_ANOMALY_DEST_RADIUS_M) &&
-        (_lpos_ground_speed <= AUTO_LAND_ANOMALY_MAX_SPEED_M_S);
-
-    if (!arrived) {
-        _motor_auto_land_arrival_us = 0;
-        _motor_auto_land_last_arrived_us = 0;
-        return;
-    }
-
-    _motor_auto_land_last_arrived_us = timestamp;
-
-    if (_motor_auto_land_arrival_us == 0) {
-        _motor_auto_land_arrival_us = timestamp;
-
-        _motor_land_hold_n_m = _lpos_n_m;
-        _motor_land_hold_e_m = _lpos_e_m;
-
-        PX4_INFO("\n[Motor-Land] Destination reached | err_xy=%.1f m | vel=%.2f m/s | window=%.1f s\n",
-            static_cast<double>(horizontal_error),
-            static_cast<double>(_lpos_ground_speed),
-            static_cast<double>(AUTO_LAND_STABLE_US) / 1e6);
-
-        return;
-    }
-
-    const uint64_t preland_elapsed_us = timestamp - _motor_auto_land_arrival_us;
-
-    if (preland_elapsed_us < AUTO_LAND_STABLE_US) {
-        return;
-    }
-
-    _motor_landing_active = true;
-    _motor_auto_land_sent = true;
-
-    publishMotorLandCommand(timestamp);
+    publishGenericLandCommand(timestamp, land_hold_n_m, land_hold_e_m, log_tag);
 }
 
 // Envia comando de desarme assim que o detector de pouso do PX4 (ou, em ultimo
 // caso, os sensores de ground-truth do Gazebo usados apenas para confirmar o
-// solo) indicar contato com o solo. A anomalia de motor em si nunca e usada
-// como criterio aqui.
-void GZBridge::checkMotorAutoDisarm(uint64_t timestamp)
+// solo) indicar contato com o solo. A anomalia original nunca e usada como
+// criterio aqui.
+void GZBridge::checkGenericAnomalyAutoDisarm(
+    uint64_t timestamp,
+    bool &landing_active,
+    bool &auto_land_sent,
+    bool &auto_disarm_sent,
+    uint32_t &sim_agl_ground_count,
+    const char *log_tag)
 {
-    if (!_motor_landing_active || !_motor_auto_land_sent || _motor_auto_disarm_sent) {
+    if (!landing_active || !auto_land_sent || auto_disarm_sent) {
         return;
     }
 
@@ -2599,7 +2593,7 @@ void GZBridge::checkMotorAutoDisarm(uint64_t timestamp)
         (_ground_distance_m <= AUTO_LAND_GROUND_DISARM_DIST_M);
 
     // Ground-truth do Gazebo, usado exclusivamente para confirmar contato com
-    // o solo durante o pouso, nunca para detectar a anomalia de motor.
+    // o solo durante o pouso, nunca para detectar a anomalia original.
     const bool sim_ground_recent =
         _sim_agl_valid &&
         (timestamp >= _sim_agl_timestamp) &&
@@ -2608,18 +2602,18 @@ void GZBridge::checkMotorAutoDisarm(uint64_t timestamp)
 
     if (sim_ground_recent) {
         if (_sim_agl_m <= AUTO_LAND_SIM_GROUND_DISARM_AGL_M) {
-            _motor_sim_agl_ground_count++;
+            sim_agl_ground_count++;
         } else {
-            _motor_sim_agl_ground_count = 0;
+            sim_agl_ground_count = 0;
         }
     } else {
-        _motor_sim_agl_ground_count = 0;
+        sim_agl_ground_count = 0;
     }
 
     const bool ground_contact_by_sim_agl =
         sim_ground_recent &&
         (_sim_agl_m <= AUTO_LAND_SIM_GROUND_DISARM_AGL_M) &&
-        (_motor_sim_agl_ground_count >= SIM_AGL_GROUND_CONFIRM_COUNT);
+        (sim_agl_ground_count >= SIM_AGL_GROUND_CONFIRM_COUNT);
 
     if (!ground_contact_by_px4_landed &&
             !ground_contact_by_px4_early &&
@@ -2647,35 +2641,37 @@ void GZBridge::checkMotorAutoDisarm(uint64_t timestamp)
     }
 
     if (ground_contact_by_px4_landed) {
-        PX4_WARN("\n[Motor-Land] PX4 landing detector confirmed landed - normal disarm\n");
+        PX4_WARN("\n[%s-Land] PX4 landing detector confirmed landed - normal disarm\n", log_tag);
 
     } else if (ground_contact_by_px4_early) {
-        PX4_WARN("\n[Motor-Land] PX4 landing detector reported ground contact - safety disarm\n");
+        PX4_WARN("\n[%s-Land] PX4 landing detector reported ground contact - safety disarm\n", log_tag);
 
     } else if (ground_contact_by_sensor) {
-        PX4_WARN("\n[Motor-Land] Downward distance sensor reported ground contact | dist=%.2f m - safety disarm\n",
+        PX4_WARN("\n[%s-Land] Downward distance sensor reported ground contact | dist=%.2f m - safety disarm\n",
+            log_tag,
             static_cast<double>(_ground_distance_m));
 
     } else {
-        PX4_WARN("\n[Motor-Land] Simulated ground proximity reached | agl=%.2f m - safety disarm\n",
+        PX4_WARN("\n[%s-Land] Simulated ground proximity reached | agl=%.2f m - safety disarm\n",
+            log_tag,
             static_cast<double>(_sim_agl_m));
     }
 
-    publishMotorDisarmCommand(timestamp, force_disarm);
-    _motor_auto_disarm_sent = true;
-    _motor_auto_land_sent = true;
-    _motor_landing_active = false;
+    publishGenericDisarmCommand(timestamp, force_disarm, log_tag);
+    auto_disarm_sent = true;
+    auto_land_sent = true;
+    landing_active = false;
 }
 
 // Envia LAND com coordenada global explicita no ponto de chegada (posicao
 // fixa; a descida vertical fica sob controle do modo LAND do PX4).
-void GZBridge::publishMotorLandCommand(uint64_t timestamp)
+void GZBridge::publishGenericLandCommand(uint64_t timestamp, double land_hold_n_m, double land_hold_e_m, const char *log_tag)
 {
     double land_lat = 0.0;
     double land_lon = 0.0;
     _pos_ref.reproject(
-        static_cast<float>(_motor_land_hold_n_m),
-        static_cast<float>(_motor_land_hold_e_m),
+        static_cast<float>(land_hold_n_m),
+        static_cast<float>(land_hold_e_m),
         land_lat,
         land_lon);
 
@@ -2699,15 +2695,16 @@ void GZBridge::publishMotorLandCommand(uint64_t timestamp)
 
     _vehicle_command_pub.publish(cmd);
 
-    PX4_WARN("\n[Motor-Land] Controlled landing started | hold N=%.1f E=%.1f | lat=%.7f lon=%.7f\n",
-        _motor_land_hold_n_m,
-        _motor_land_hold_e_m,
+    PX4_WARN("\n[%s-Land] Controlled landing started | hold N=%.1f E=%.1f | lat=%.7f lon=%.7f\n",
+        log_tag,
+        land_hold_n_m,
+        land_hold_e_m,
         land_lat,
         land_lon);
 }
 
 // Envia o comando de desarme do PX4 apos confirmacao de contato com o solo.
-void GZBridge::publishMotorDisarmCommand(uint64_t timestamp, bool force_disarm)
+void GZBridge::publishGenericDisarmCommand(uint64_t timestamp, bool force_disarm, const char *log_tag)
 {
     vehicle_command_s cmd{};
     cmd.timestamp = timestamp;
@@ -2728,10 +2725,56 @@ void GZBridge::publishMotorDisarmCommand(uint64_t timestamp, bool force_disarm)
 
     _vehicle_command_pub.publish(cmd);
 
-    PX4_WARN("\n[Motor-Land] %s disarm command sent after ground contact confirmation.\n",
+    PX4_WARN("\n[%s-Land] %s disarm command sent after ground contact confirmation.\n",
+        log_tag,
         force_disarm ? "Forced" : "Normal");
 }
+// ======== MITIGACAO DE POUSO GENERICA - FIM ========
+
+// ======== MITIGACAO DE POUSO IMU - INICIO ========
+void GZBridge::checkImuAutoLand(uint64_t timestamp)
+{
+    checkGenericAnomalyAutoLand(timestamp, _imu_anomaly_active, _imu_landing_active,
+        _imu_auto_land_sent, _imu_auto_land_arrival_us, _imu_auto_land_last_arrived_us,
+        _imu_land_hold_n_m, _imu_land_hold_e_m, "IMU");
+}
+
+void GZBridge::checkImuAutoDisarm(uint64_t timestamp)
+{
+    checkGenericAnomalyAutoDisarm(timestamp, _imu_landing_active, _imu_auto_land_sent,
+        _imu_auto_disarm_sent, _imu_sim_agl_ground_count, "IMU");
+}
+// ======== MITIGACAO DE POUSO IMU - FIM ========
+
+// ======== MITIGACAO DE POUSO MOTOR - INICIO ========
+void GZBridge::checkMotorAutoLand(uint64_t timestamp)
+{
+    checkGenericAnomalyAutoLand(timestamp, _mixing_interface_esc.motorAnomalyActive(), _motor_landing_active,
+        _motor_auto_land_sent, _motor_auto_land_arrival_us, _motor_auto_land_last_arrived_us,
+        _motor_land_hold_n_m, _motor_land_hold_e_m, "Motor");
+}
+
+void GZBridge::checkMotorAutoDisarm(uint64_t timestamp)
+{
+    checkGenericAnomalyAutoDisarm(timestamp, _motor_landing_active, _motor_auto_land_sent,
+        _motor_auto_disarm_sent, _motor_sim_agl_ground_count, "Motor");
+}
 // ======== MITIGACAO DE POUSO MOTOR - FIM ========
+
+// ======== MITIGACAO DE POUSO MAGNETOMETRO - INICIO ========
+void GZBridge::checkMagAutoLand(uint64_t timestamp)
+{
+    checkGenericAnomalyAutoLand(timestamp, _mag_anomaly_active, _mag_landing_active,
+        _mag_auto_land_sent, _mag_auto_land_arrival_us, _mag_auto_land_last_arrived_us,
+        _mag_land_hold_n_m, _mag_land_hold_e_m, "Mag");
+}
+
+void GZBridge::checkMagAutoDisarm(uint64_t timestamp)
+{
+    checkGenericAnomalyAutoDisarm(timestamp, _mag_landing_active, _mag_auto_land_sent,
+        _mag_auto_disarm_sent, _mag_sim_agl_ground_count, "Mag");
+}
+// ======== MITIGACAO DE POUSO MAGNETOMETRO - FIM ========
 
 // ======== MITIGACAO BLACKOUT GPS - INICIO ========
 // Publica uma pseudo-medicao GPS durante blackout usando VIO quando disponivel
@@ -3122,6 +3165,23 @@ void GZBridge::odometryCallback(const gz::msgs::OdometryWithCovariance &msg)
         }
     }
     // ======== MITIGACAO IMU - FIM ========
+
+    // ======== MITIGACAO MAGNETOMETRO - INICIO ========
+    // Extrai heading, roll e pitch da atitude da propria VIO, referencia
+    // independente do magnetometro usada em magnetometerCallback.
+    if (vio_sample_accepted) {
+        const matrix::Quatf q_nb_att(q_nb.W(), q_nb.X(), q_nb.Y(), q_nb.Z());
+        const matrix::Eulerf euler_vio{q_nb_att};
+
+        if (PX4_ISFINITE(euler_vio.psi()) && PX4_ISFINITE(euler_vio.phi()) && PX4_ISFINITE(euler_vio.theta())) {
+            _vio_heading_rad = euler_vio.psi();
+            _vio_roll_rad = euler_vio.phi();
+            _vio_pitch_rad = euler_vio.theta();
+            _vio_heading_valid = true;
+            _vio_heading_us = timestamp;
+        }
+    }
+    // ======== MITIGACAO MAGNETOMETRO - FIM ========
 
     // Velocidade linear convertida de FLU para FRD.
     report.velocity_frame = vehicle_odometry_s::VELOCITY_FRAME_BODY_FRD;
