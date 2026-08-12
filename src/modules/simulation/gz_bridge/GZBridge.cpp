@@ -43,6 +43,7 @@
 
 #include <iostream>
 #include <string>
+#include <cstring>
 
 
 // Inicializa a instancia da ponte Gazebo-PX4 com o mundo e o modelo simulados.
@@ -110,6 +111,16 @@ int GZBridge::init()
         if (!subscribeDistanceSensor(false)) {
             return PX4_ERROR;
         }
+
+        // LiDAR frontal em modelos combinados (link/sensor com nome
+        // distinto do down). Opcional: modelos com um so sensor de
+        // distancia nao tem esse topico, e a falha aqui e esperada.
+        subscribeDistanceSensorFront(false);
+
+        // Camera de profundidade e opcional: so o x500_uavjamsim a tem,
+        // usada como referencia cruzada do LiDAR frontal. Falha em se
+        // inscrever nao interrompe a inicializacao.
+        subscribeDepthCamera(false);
     }
 
     if (_sim_gz_en_aspd.get()) {
@@ -282,7 +293,7 @@ bool GZBridge::subscribeLaserScan(bool required)
     return true;
 }
 
-// Inscreve a ponte no sensor de distancia usado como LiDAR/sonar.
+// Inscreve a ponte no sensor de distancia LiDAR.
 bool GZBridge::subscribeDistanceSensor(bool required)
 {
     std::string lidar_sensor = "/world/" + _world_name + "/model/" + _model_name +
@@ -290,6 +301,54 @@ bool GZBridge::subscribeDistanceSensor(bool required)
 
     if (!_node.Subscribe(lidar_sensor, &GZBridge::laserScantoLidarSensorCallback, this)) {
         PX4_WARN("failed to subscribe to %s", lidar_sensor.c_str());
+        return required ? false : true;
+    }
+
+    return true;
+}
+
+// Inscreve a ponte no LiDAR frontal de modelos combinados (link/sensor com
+// nome distinto do down, ex.: x500_uavjamsim). Reaproveita o mesmo callback
+// do sensor de distancia: a orientacao e detectada dinamicamente pelo
+// quaternion da mensagem, e o publish final escolhe a instancia certa
+// (_distance_sensor_pub ou _distance_sensor_front_pub) de acordo com ela.
+bool GZBridge::subscribeDistanceSensorFront(bool required)
+{
+    std::string lidar_front_sensor = "/world/" + _world_name + "/model/" + _model_name +
+                   "/link/lidar_front_sensor_link/sensor/lidar_front/scan";
+
+    if (!_node.Subscribe(lidar_front_sensor, &GZBridge::laserScantoLidarSensorFrontCallback, this)) {
+        PX4_WARN("failed to subscribe to %s", lidar_front_sensor.c_str());
+        return required ? false : true;
+    }
+
+    return true;
+}
+
+// Inscreve a ponte na camera de profundidade (OakD-Lite), quando o modelo
+// tiver uma (so o x500_uavjamsim). Usada como referencia cruzada
+// independente pela mitigacao de LiDAR frontal e do LiDAR 2D.
+//
+// Usa o nome de topico FIXO ("/depth_camera", definido pela tag <topic> no
+// sensor StereoOV7251 do model.sdf), nao o caminho hierarquico automatico
+// (/world/.../sensor/StereoOV7251/depth_image). Confirmado empiricamente
+// que o sensor "depth_camera" do Gazebo so publica de fato no topico fixo
+// quando a tag <topic> esta presente no SDF — o caminho hierarquico
+// aparece listado (gz topic -l) mas nunca tem publicador ativo. Isso NAO
+// e um problema de driver/GPU: a mesma maquina publica normalmente assim
+// que o topico fixo e usado. Se o nome do topico no SDF mudar, essa
+// string precisa mudar junto.
+//
+// Limitacao conhecida: por ser um nome fixo (nao escopado por mundo ou
+// instancia de modelo), isso so funciona corretamente com um unico
+// veiculo rodando por vez — varias instancias do x500_uavjamsim
+// simultaneas colidiriam nesse mesmo topico.
+bool GZBridge::subscribeDepthCamera(bool required)
+{
+    std::string depth_topic = "/depth_camera";
+
+    if (!_node.Subscribe(depth_topic, &GZBridge::depthCameraCallback, this)) {
+        PX4_WARN("failed to subscribe to %s", depth_topic.c_str());
         return required ? false : true;
     }
 
@@ -364,7 +423,6 @@ bool GZBridge::subscribeAttacks(bool required)
     std::string mag_attack_topic = "/gazebo/default/attack/mag";
     std::string lidar_attack_topic = "/gazebo/default/attack/lidar";
     std::string stream_attack_topic = "/gazebo/default/attack/stream";
-    std::string sonar_attack_topic = "/gazebo/default/attack/sonar";
     std::string baro_attack_topic = "/gazebo/default/attack/baro";
     std::string jamming_attack_topic = "/gazebo/default/attack/jamming";
 
@@ -403,11 +461,6 @@ bool GZBridge::subscribeAttacks(bool required)
 
     if (!_node.Subscribe(stream_attack_topic, &GZBridge::streamAttackCallback, this)) {
         PX4_ERR("failed to subscribe to attack topic: %s", stream_attack_topic.c_str());
-        return required ? false : true;
-    }
-
-    if (!_node.Subscribe(sonar_attack_topic, &GZBridge::sonarAttackCallback, this)) {
-        PX4_ERR("failed to subscribe to attack topic: %s", sonar_attack_topic.c_str());
         return required ? false : true;
     }
 
@@ -511,19 +564,6 @@ void GZBridge::lidarAttackCallback(const gz::msgs::Vector3d &msg)
     PX4_INFO("Lidar Attack: Option=%d, Offset=%.2f", _lidar_attack_option, _lidar_distance_offset);
 }
 // ======== ATAQUE LIDAR - FIM ========
-
-// ======== ATAQUE SONAR - INICIO ========
-// Ataque no sonar: configura ativacao e offset de distancia em metros.
-void GZBridge::sonarAttackCallback(const gz::msgs::Vector3d &msg)
-{
-
-    // msg.x habilita/desabilita o ataque; msg.y define o deslocamento de distancia.
-    _sonar_attack_option = static_cast<int>(msg.x());
-    _sonar_distance_offset = msg.y();
-
-    PX4_INFO("Sonar Attack: Option=%d, Offset=%.2f", _sonar_attack_option, _sonar_distance_offset);
-}
-// ======== ATAQUE SONAR - FIM ========
 
 // ======== ATAQUE IMU - INICIO ========
 // Ataque na IMU: habilita offsets, desabilitacao total ou limpeza das perturbacoes por eixo.
@@ -758,7 +798,6 @@ void GZBridge::attackMitigationCallback(const gz::msgs::Vector3d &msg)
 
     // Reinicia o estado da mitigacao de magnetometro (deteccao, linha de
     // base, pouso).
-    _mag_ever_armed = false;
     _mag_baseline_initialized = false;
     _mag_baseline_warmup_count = 0;
     _mag_heading_offset_rad = 0.0;
@@ -774,6 +813,56 @@ void GZBridge::attackMitigationCallback(const gz::msgs::Vector3d &msg)
     _mag_land_hold_n_m = 0.0;
     _mag_land_hold_e_m = 0.0;
     _mag_sim_agl_ground_count = 0;
+
+    // Reinicia o estado da mitigacao de LiDAR (deteccao, ancora, pouso).
+    _lidar_baseline_initialized = false;
+    _lidar_baseline_warmup_count = 0;
+    _lidar_anchor_offset_m = 0.0;
+    _lidar_anomaly_active = false;
+    _lidar_anomaly_start_us = 0;
+    _lidar_recovery_start_us = 0;
+    _lidar_mitig_diag_count = 0;
+    _lidar_landing_active = false;
+    _lidar_auto_land_sent = false;
+    _lidar_auto_disarm_sent = false;
+    _lidar_auto_land_arrival_us = 0;
+    _lidar_auto_land_last_arrived_us = 0;
+    _lidar_land_hold_n_m = 0.0;
+    _lidar_land_hold_e_m = 0.0;
+    _lidar_sim_agl_ground_count = 0;
+
+    // Reinicia o estado da mitigacao de LiDAR frontal (deteccao, pouso).
+    // O cache da camera de profundidade (_depth_cam_*) nao e resetado aqui:
+    // ele nao depende do estado da mitigacao, so reflete a leitura mais
+    // recente do sensor, igual outros caches de referencia do projeto.
+    _lidar_front_anomaly_active = false;
+    _lidar_front_anomaly_start_us = 0;
+    _lidar_front_recovery_start_us = 0;
+    _lidar_front_mitig_diag_count = 0;
+    _lidar_front_landing_active = false;
+    _lidar_front_auto_land_sent = false;
+    _lidar_front_auto_disarm_sent = false;
+    _lidar_front_auto_land_arrival_us = 0;
+    _lidar_front_auto_land_last_arrived_us = 0;
+    _lidar_front_land_hold_n_m = 0.0;
+    _lidar_front_land_hold_e_m = 0.0;
+    _lidar_front_sim_agl_ground_count = 0;
+
+    // Reinicia o estado da mitigacao de LiDAR 2D (deteccao, pouso). O cache
+    // por setor (_depth_cam_sector_*) nao e resetado pelo mesmo motivo do
+    // cache central acima.
+    _lidar2d_anomaly_active = false;
+    _lidar2d_anomaly_start_us = 0;
+    _lidar2d_recovery_start_us = 0;
+    _lidar2d_mitig_diag_count = 0;
+    _lidar2d_landing_active = false;
+    _lidar2d_auto_land_sent = false;
+    _lidar2d_auto_disarm_sent = false;
+    _lidar2d_auto_land_arrival_us = 0;
+    _lidar2d_auto_land_last_arrived_us = 0;
+    _lidar2d_land_hold_n_m = 0.0;
+    _lidar2d_land_hold_e_m = 0.0;
+    _lidar2d_sim_agl_ground_count = 0;
 
     if (_attack_mitigation_enabled) {
         PX4_WARN("\n[Mitigation] KF-Jamming mitigation ENABLED\n");
@@ -884,19 +973,11 @@ void GZBridge::magnetometerCallback(const gz::msgs::Magnetometer &msg)
     // nivelado (roll/pitch da VIO abaixo de MAG_MAX_TILT_RAD): a convencao de
     // eixos do magnetometro simulado nao e garantida como a mesma FRD usada
     // por accel/gyro, entao nao arriscamos compensar inclinacao via rotacao.
-    actuator_armed_s mag_actuator_armed{};
-    const bool mag_armed_available = _actuator_armed_sub.copy(&mag_actuator_armed);
-    const bool mag_vehicle_armed = mag_armed_available && mag_actuator_armed.armed;
-
-    vehicle_land_detected_s mag_land_detected{};
-    const bool mag_land_detector_available = _vehicle_land_detected_sub.copy(&mag_land_detected);
-    const bool mag_vehicle_not_landed = mag_land_detector_available && !mag_land_detected.landed;
-
-    if (mag_vehicle_armed && mag_vehicle_not_landed) {
-        _mag_ever_armed = true;
-    }
-
-    if (_attack_mitigation_enabled && _mag_ever_armed) {
+    // Nao exige que o veiculo ja tenha armado/voado: o heading e valido
+    // (e ate mais facil de validar, ja que vio_near_level tende a ser
+    // verdadeiro parado no chao) mesmo antes da decolagem, e o ataque deve
+    // ser detectavel nesse estado.
+    if (_attack_mitigation_enabled) {
 
         const double horiz_mag = sqrt(
             static_cast<double>(report.x) * static_cast<double>(report.x) +
@@ -1016,8 +1097,6 @@ void GZBridge::magnetometerCallback(const gz::msgs::Magnetometer &msg)
                     math::degrees(offset),
                     math::degrees(_mag_heading_offset_rad),
                     horiz_out_of_bounds ? "out" : "ok");
-
-                PX4_INFO("\n[Mag-Mitig] Run 'listener vehicle_magnetometer' to check the corrected reading.\n");
             }
 
             // Reconstroi a direcao a partir do heading esperado (reflexao do
@@ -1048,6 +1127,10 @@ void GZBridge::magnetometerCallback(const gz::msgs::Magnetometer &msg)
                         static_cast<double>(math::degrees(_vio_heading_rad)),
                         horiz_mag,
                         _vio_heading_valid ? static_cast<double>(timestamp - _vio_heading_us) / 1000.0 : -1.0);
+
+                    if (_mag_mitig_diag_count == MAG_MITIG_DIAG_MAX_COUNT) {
+                        PX4_WARN("\n[Mag-Mitig] Check: listener vehicle_magnetometer\n");
+                    }
                 }
             }
         }
@@ -1961,6 +2044,21 @@ void GZBridge::imuCallback(const gz::msgs::IMU &msg)
     checkMagAutoDisarm(timestamp);
     // ======== MITIGACAO DE POUSO MAGNETOMETRO - FIM ========
 
+    // ======== MITIGACAO DE POUSO LIDAR - INICIO ========
+    checkLidarAutoLand(timestamp);
+    checkLidarAutoDisarm(timestamp);
+    // ======== MITIGACAO DE POUSO LIDAR - FIM ========
+
+    // ======== MITIGACAO DE POUSO LIDAR FRONTAL - INICIO ========
+    checkLidarFrontAutoLand(timestamp);
+    checkLidarFrontAutoDisarm(timestamp);
+    // ======== MITIGACAO DE POUSO LIDAR FRONTAL - FIM ========
+
+    // ======== MITIGACAO DE POUSO LIDAR 2D - INICIO ========
+    checkLidar2dAutoLand(timestamp);
+    checkLidar2dAutoDisarm(timestamp);
+    // ======== MITIGACAO DE POUSO LIDAR 2D - FIM ========
+
 }
 
 // ======== MITIGACAO DE POUSO GPS - INICIO ========
@@ -2776,6 +2874,52 @@ void GZBridge::checkMagAutoDisarm(uint64_t timestamp)
 }
 // ======== MITIGACAO DE POUSO MAGNETOMETRO - FIM ========
 
+// ======== MITIGACAO DE POUSO LIDAR - INICIO ========
+void GZBridge::checkLidarAutoLand(uint64_t timestamp)
+{
+    checkGenericAnomalyAutoLand(timestamp, _lidar_anomaly_active, _lidar_landing_active,
+        _lidar_auto_land_sent, _lidar_auto_land_arrival_us, _lidar_auto_land_last_arrived_us,
+        _lidar_land_hold_n_m, _lidar_land_hold_e_m, "Lidar");
+}
+
+void GZBridge::checkLidarAutoDisarm(uint64_t timestamp)
+{
+    checkGenericAnomalyAutoDisarm(timestamp, _lidar_landing_active, _lidar_auto_land_sent,
+        _lidar_auto_disarm_sent, _lidar_sim_agl_ground_count, "Lidar");
+}
+// ======== MITIGACAO DE POUSO LIDAR - FIM ========
+
+// ======== MITIGACAO DE POUSO LIDAR FRONTAL - INICIO ========
+void GZBridge::checkLidarFrontAutoLand(uint64_t timestamp)
+{
+    checkGenericAnomalyAutoLand(timestamp, _lidar_front_anomaly_active, _lidar_front_landing_active,
+        _lidar_front_auto_land_sent, _lidar_front_auto_land_arrival_us, _lidar_front_auto_land_last_arrived_us,
+        _lidar_front_land_hold_n_m, _lidar_front_land_hold_e_m, "LidarFront");
+}
+
+void GZBridge::checkLidarFrontAutoDisarm(uint64_t timestamp)
+{
+    checkGenericAnomalyAutoDisarm(timestamp, _lidar_front_landing_active, _lidar_front_auto_land_sent,
+        _lidar_front_auto_disarm_sent, _lidar_front_sim_agl_ground_count, "LidarFront");
+}
+// ======== MITIGACAO DE POUSO LIDAR FRONTAL - FIM ========
+
+// ======== MITIGACAO DE POUSO LIDAR 2D - INICIO ========
+void GZBridge::checkLidar2dAutoLand(uint64_t timestamp)
+{
+    checkGenericAnomalyAutoLand(timestamp, _lidar2d_anomaly_active, _lidar2d_landing_active,
+        _lidar2d_auto_land_sent, _lidar2d_auto_land_arrival_us, _lidar2d_auto_land_last_arrived_us,
+        _lidar2d_land_hold_n_m, _lidar2d_land_hold_e_m, "Lidar2D");
+}
+
+void GZBridge::checkLidar2dAutoDisarm(uint64_t timestamp)
+{
+    checkGenericAnomalyAutoDisarm(timestamp, _lidar2d_landing_active, _lidar2d_auto_land_sent,
+        _lidar2d_auto_disarm_sent, _lidar2d_sim_agl_ground_count, "Lidar2D");
+}
+// ======== MITIGACAO DE POUSO LIDAR 2D - FIM ========
+
+
 // ======== MITIGACAO BLACKOUT GPS - INICIO ========
 // Publica uma pseudo-medicao GPS durante blackout usando VIO quando disponivel
 // ou dead-reckoning horizontal a partir da ultima velocidade confiavel.
@@ -3036,6 +3180,7 @@ void GZBridge::odometryCallback(const gz::msgs::OdometryWithCovariance &msg)
     // ======== MITIGACAO BLACKOUT GPS - INICIO ========
     // Cache VIO used as auxiliary localization during GPS blackout.
     // The cache is accepted only when covariance and motion are plausible.
+
     if (_pos_ref.isInitialized() &&
             PX4_ISFINITE(report.position[0]) &&
             PX4_ISFINITE(report.position[1]) &&
@@ -4027,24 +4172,148 @@ void GZBridge::navSatCallback(const gz::msgs::NavSat &msg)
     _sensor_gps_pub.publish(sensor_gps);
 }
 
-// Publica sensor de distancia e aplica offsets de ataque de LiDAR ou sonar.
-void GZBridge::laserScantoLidarSensorCallback(const gz::msgs::LaserScan &msg)
+// Extrai a profundidade media de uma pequena janela central da imagem
+// (mesma direcao do LiDAR frontal), usada como referencia cruzada
+// independente pela mitigacao. So o x500_uavjamsim publica esse topico.
+// Amostra a profundidade media de um patch ~7x7 pixels ao redor de (cx, cy).
+// Retorna NAN se a janela cair fora da imagem ou nao encontrar pixel valido.
+float GZBridge::samplePatchDepth(const gz::msgs::Image &msg, int cx, int cy, int patch_half)
 {
+    const int width = static_cast<int>(msg.width());
+    const int height = static_cast<int>(msg.height());
+
+    if (width <= 0 || height <= 0) {
+        return NAN;
+    }
+
+    const char *data = msg.data().data();
+    const size_t data_size = msg.data().size();
+
+    double sum = 0.0;
+    int count = 0;
+
+    for (int dy = -patch_half; dy <= patch_half; dy++) {
+        const int y = cy + dy;
+
+        if (y < 0 || y >= height) {
+            continue;
+        }
+
+        for (int dx = -patch_half; dx <= patch_half; dx++) {
+            const int x = cx + dx;
+
+            if (x < 0 || x >= width) {
+                continue;
+            }
+
+            const size_t offset = (static_cast<size_t>(y) * width + x) * sizeof(float);
+
+            if (offset + sizeof(float) > data_size) {
+                continue;
+            }
+
+            float depth = 0.0f;
+            memcpy(&depth, data + offset, sizeof(float));
+
+            if (PX4_ISFINITE(depth) && depth > 0.0f) {
+                sum += static_cast<double>(depth);
+                count++;
+            }
+        }
+    }
+
+    return (count > 0) ? static_cast<float>(sum / count) : NAN;
+}
+
+void GZBridge::depthCameraCallback(const gz::msgs::Image &msg)
+{
+    const uint64_t timestamp = hrt_absolute_time();
+
+    const int width = static_cast<int>(msg.width());
+    const int height = static_cast<int>(msg.height());
+
+    if (width <= 0 || height <= 0) {
+        return;
+    }
+
+    const int patch_half = 3; // janela ~7x7 pixels
+    const int cx = width / 2;
+    const int cy = height / 2;
+
+    // Leitura central (usada pela mitigacao do LiDAR frontal).
+    const float center_depth = samplePatchDepth(msg, cx, cy, patch_half);
+
+    if (PX4_ISFINITE(center_depth)) {
+        _depth_cam_distance_m = center_depth;
+        _depth_cam_distance_valid = true;
+        _depth_cam_distance_timestamp = timestamp;
+    }
+
+    // Leitura por setor (usada pela mitigacao do LiDAR 2D): projeta cada
+    // angulo de setor coberto na coluna de pixel correspondente, usando o
+    // campo de visao horizontal conhecido da camera (StereoOV7251, ver
+    // OakD-Lite/model.sdf), e amostra um patch nessa coluna.
+    static constexpr double CAMERA_HFOV_RAD = 1.274;
+    static constexpr double LIDAR2D_SECTOR_DEG = 5.0;
+
+    const double focal_px = (static_cast<double>(width) / 2.0) / tan(CAMERA_HFOV_RAD / 2.0);
+    bool any_sector_valid = false;
+
+    for (int k = -LIDAR2D_DEPTH_COVERAGE_HALF_SECTORS; k <= LIDAR2D_DEPTH_COVERAGE_HALF_SECTORS; k++) {
+        const double angle_rad = static_cast<double>(k) * LIDAR2D_SECTOR_DEG * M_PI / 180.0;
+        const int px = cx + static_cast<int>(lround(focal_px * tan(angle_rad)));
+        const int idx = k + LIDAR2D_DEPTH_COVERAGE_HALF_SECTORS;
+
+        const float sector_depth = samplePatchDepth(msg, px, cy, patch_half);
+        _depth_cam_sector_distance_m[idx] = sector_depth;
+
+        if (PX4_ISFINITE(sector_depth)) {
+            any_sector_valid = true;
+        }
+    }
+
+    if (any_sector_valid) {
+        _depth_cam_sector_valid = true;
+        _depth_cam_sector_timestamp = timestamp;
+    }
+}
+
+// Publica sensor de distancia e aplica offset de ataque de LiDAR. Logica
+// compartilhada pelas duas inscricoes possiveis (down e, em modelos
+// combinados como o x500_uavjamsim, front) — is_front_slot diz qual delas
+// chamou, para usar device address e instancia uORB de publicacao proprios,
+// sem depender da orientacao detectada na mensagem (isso preserva o
+// comportamento ja testado do x500_lidar_front standalone, que so tem a
+// inscricao "down" mas fisicamente aponta para frente).
+void GZBridge::laserScantoLidarSensorCallbackImpl(const gz::msgs::LaserScan &msg, bool is_front_slot)
+{
+    const uint64_t timestamp = hrt_absolute_time();
 
     device::Device::DeviceId id{};
     id.devid_s.bus_type = device::Device::DeviceBusType::DeviceBusType_SIMULATION;
     id.devid_s.devtype = DRV_DIST_DEVTYPE_SIM;
     id.devid_s.bus = 1;
-    id.devid_s.address = 1;
+    id.devid_s.address = is_front_slot ? 2 : 1;
 
     distance_sensor_s report{};
-    report.timestamp = hrt_absolute_time();
+    report.timestamp = timestamp;
     report.device_id = id.devid;
-    report.min_distance = 0.02f;
-    report.max_distance = 5.0f;
+    report.min_distance = LIDAR_RANGE_MIN_M;
+    report.max_distance = LIDAR_RANGE_MAX_M;
 
     // Leitura bruta do primeiro feixe; o offset simula erro no sensor de distancia.
+    // Sem retorno (nada no alcance), o valor bruto vem como infinito ou como
+    // o proprio alcance maximo da mensagem (msg.range_max()): um offset
+    // negativo aplicado direto sobre isso nunca produziria um numero finito
+    // menor. Para o ataque conseguir forjar uma deteccao onde nao havia
+    // nenhuma (cenario realista de spoofing), a leitura "sem retorno" e
+    // tratada como o alcance maximo antes do offset ser somado.
     float raw_dist = static_cast<float>(msg.ranges()[0]);
+
+    if (!PX4_ISFINITE(raw_dist) || (raw_dist >= static_cast<float>(msg.range_max()))) {
+        raw_dist = LIDAR_RANGE_MAX_M;
+    }
+
     float processed_dist = raw_dist;
 
     // ======== ATAQUE LIDAR - INICIO ========
@@ -4054,19 +4323,12 @@ void GZBridge::laserScantoLidarSensorCallback(const gz::msgs::LaserScan &msg)
     }
     // ======== ATAQUE LIDAR - FIM ========
 
-    // ======== ATAQUE SONAR - INICIO ========
-    // Ataque sonar: soma offset a medicao de distancia.
-    else if (_sonar_attack_option == 1) {
-        processed_dist += static_cast<float>(_sonar_distance_offset);
-    }
-    // ======== ATAQUE SONAR - FIM ========
-
     // Limita a medicao ao intervalo fisico aceito pelo PX4.
     report.current_distance = math::constrain(processed_dist, report.min_distance, report.max_distance);
     report.signal_quality = -1;
 
     report.variance = 0.0f;
-    report.type = distance_sensor_s::MAV_DISTANCE_SENSOR_ULTRASOUND;
+    report.type = distance_sensor_s::MAV_DISTANCE_SENSOR_LASER;
 
     // A orientacao do sensor define se ele aponta para frente, para baixo ou em rotacao customizada.
     gz::msgs::Quaternion pose_orientation = msg.world_pose().orientation();
@@ -4092,10 +4354,254 @@ void GZBridge::laserScantoLidarSensorCallback(const gz::msgs::LaserScan &msg)
         (report.orientation == distance_sensor_s::ROTATION_DOWNWARD_FACING) ||
         (report.orientation == distance_sensor_s::ROTATION_CUSTOM);
 
-    if (_lidar_attack_option == 0 &&
-            _sonar_attack_option == 0 &&
-            touchdown_range_sensor &&
-            PX4_ISFINITE(report.current_distance)) {
+    // ======== MITIGACAO LIDAR - INICIO ========
+    // Deteccao de anomalia no sinal publicado do sensor, sem consultar
+    // _lidar_attack_option:
+    //  (a) leitura fora da faixa fisica funcional do sensor;
+    //  (b) leitura divergindo do valor esperado por uma ancora entre a
+    //      leitura do LiDAR e a altitude do barometro (referencia
+    //      independente - este airframe nao tem VIO confiavel), calibrada a
+    //      partir das primeiras amostras saudaveis. O ataque e um offset
+    //      constante, que uma comparacao por taxa de variacao nunca pegaria
+    //      (o offset se cancela na diferenca entre amostras): so uma
+    //      comparacao por valor absoluto contra essa ancora detecta.
+    // So se aplica ao sensor apontado para baixo (terrain-following); um
+    // LiDAR front-facing, se existir, mede distancia de obstaculo, nao altura.
+    // Diferente das demais mitigacoes, nao exige que o veiculo ja tenha
+    // armado/voado: a leitura do LiDAR e significativa mesmo parado no chao
+    // (mede a folga ate o solo), e o ataque deve ser detectavel nesse estado.
+    if (touchdown_range_sensor) {
+
+        if (_attack_mitigation_enabled) {
+
+            // Nao ha checagem util de limite fisico aqui: report.current_distance
+            // ja passou por math::constrain(min, max) alguns comandos acima, entao
+            // uma leitura saturada em min/max e absolutamente normal (nada no
+            // alcance, ou muito perto) e indistinguivel de uma leitura atacada
+            // empurrada para fora da faixa - as duas terminam no mesmo valor
+            // limitado. So a comparacao com a ancora abaixo consegue distinguir.
+            const bool non_finite = !PX4_ISFINITE(report.current_distance);
+
+            const bool baro_alt_recent =
+                _jmit_baro_valid &&
+                (timestamp >= _jmit_baro_timestamp) &&
+                ((timestamp - _jmit_baro_timestamp) <= LIDAR_BARO_MAX_AGE_US) &&
+                PX4_ISFINITE(_jmit_baro_alt_m);
+
+            double residual = 0.0;
+            bool residual_anomaly = false;
+
+            if (baro_alt_recent && _lidar_baseline_initialized) {
+                const double expected_dist = _lidar_anchor_offset_m + static_cast<double>(_jmit_baro_alt_m);
+                residual = static_cast<double>(report.current_distance) - expected_dist;
+                residual_anomaly = fabs(residual) > LIDAR_RESIDUAL_THRESHOLD_M;
+            }
+
+            const bool sample_anomalous = non_finite || residual_anomaly;
+            const bool sample_severe = non_finite;
+
+            if (!sample_anomalous) {
+
+                // Atualiza a ancora apenas com amostras saudaveis. As
+                // primeiras amostras (warmup) calibram com um alpha mais
+                // agressivo; depois, adapta lentamente (tolera deriva
+                // legitima de calibracao/temperatura, mas um ataque
+                // sustentado nao chega a ser absorvido, pois so entra aqui
+                // quando a amostra nao e anomala).
+                if (baro_alt_recent) {
+                    const double sample_offset = static_cast<double>(report.current_distance) - static_cast<double>(_jmit_baro_alt_m);
+
+                    if (_lidar_baseline_warmup_count == 0) {
+                        _lidar_anchor_offset_m = sample_offset;
+                        _lidar_baseline_warmup_count = 1;
+
+                    } else if (_lidar_baseline_warmup_count < LIDAR_BASELINE_WARMUP_SAMPLES) {
+                        _lidar_anchor_offset_m += LIDAR_BASELINE_WARMUP_ALPHA * (sample_offset - _lidar_anchor_offset_m);
+                        _lidar_baseline_warmup_count++;
+
+                        if (_lidar_baseline_warmup_count >= LIDAR_BASELINE_WARMUP_SAMPLES) {
+                            _lidar_baseline_initialized = true;
+                        }
+
+                    } else {
+                        _lidar_anchor_offset_m += LIDAR_BASELINE_ALPHA * (sample_offset - _lidar_anchor_offset_m);
+                    }
+                }
+
+                if (_lidar_anomaly_active) {
+                    if (_lidar_recovery_start_us == 0) {
+                        _lidar_recovery_start_us = timestamp;
+
+                    } else if ((timestamp - _lidar_recovery_start_us) >= LIDAR_RECOVERY_CONFIRM_US) {
+                        _lidar_anomaly_active = false;
+                        _lidar_anomaly_start_us = 0;
+                        _lidar_mitig_diag_count = 0;
+
+                        PX4_INFO("\n[Lidar-Mitig] Sensor anomaly cleared\n");
+                    }
+                }
+
+            } else {
+                _lidar_recovery_start_us = 0;
+
+                if (_lidar_anomaly_start_us == 0) {
+                    _lidar_anomaly_start_us = timestamp;
+                }
+
+                const uint64_t confirm_required_us =
+                    sample_severe ? LIDAR_ANOMALY_CONFIRM_SEVERE_US : LIDAR_ANOMALY_CONFIRM_US;
+
+                if (!_lidar_anomaly_active &&
+                        ((timestamp - _lidar_anomaly_start_us) >= confirm_required_us)) {
+                    _lidar_anomaly_active = true;
+
+                    PX4_WARN("\n[Lidar-Mitig] Sensor anomaly detected | dist=%.2f m | residual=%.2f m | finite=%s\n",
+                        static_cast<double>(report.current_distance),
+                        residual,
+                        non_finite ? "no" : "yes");
+                }
+
+                // Reconstroi a leitura a partir da ancora e da altitude atual
+                // do barometro, preservando a fisica do sensor (nunca fora
+                // dos limites). So corrige quando o barometro e a ancora ja
+                // calibrada estao disponiveis; sem isso, deixa a leitura
+                // crua passar (melhor que travar em um valor desatualizado).
+                if (_lidar_anomaly_active && baro_alt_recent && _lidar_baseline_initialized) {
+                    const double expected_dist = _lidar_anchor_offset_m + static_cast<double>(_jmit_baro_alt_m);
+                    report.current_distance = static_cast<float>(math::constrain(
+                        expected_dist,
+                        static_cast<double>(report.min_distance),
+                        static_cast<double>(report.max_distance)));
+                }
+
+                if (_lidar_anomaly_active && (_lidar_mitig_diag_count < LIDAR_MITIG_DIAG_MAX_COUNT)) {
+                    static uint64_t lidar_mitig_diag_last_us = 0;
+
+                    if ((timestamp - lidar_mitig_diag_last_us) > 1000000ULL) {
+                        lidar_mitig_diag_last_us = timestamp;
+                        _lidar_mitig_diag_count++;
+
+                        PX4_INFO("\n[Lidar-Mitig] Status | dist=%.2f m | residual=%.2f m | baro_alt=%s\n",
+                            static_cast<double>(report.current_distance),
+                            residual,
+                            baro_alt_recent ? "ok" : "stale");
+
+                        if (_lidar_mitig_diag_count == LIDAR_MITIG_DIAG_MAX_COUNT) {
+                            PX4_WARN("\n[Lidar-Mitig] Check: listener distance_sensor (down, inst 0)\n");
+                        }
+                    }
+                }
+            }
+        }
+    }
+    // ======== MITIGACAO LIDAR - FIM ========
+
+    // ======== MITIGACAO LIDAR FRONTAL - INICIO ========
+    // Deteccao de anomalia comparando a leitura publicada contra a camera de
+    // profundidade (OakD-Lite, so presente no x500_uavjamsim), referencia
+    // independente do LiDAR. Diferente da mitigacao do LiDAR para baixo, os
+    // dois sensores medem a mesma coisa em tempo real (nao e um offset
+    // constante que se cancela na diferenca entre amostras aqui, ja que a
+    // camera nao esta sob o mesmo ataque): e uma comparacao direta, sem
+    // ancora/calibracao. Sem essa camera disponivel (qualquer outro
+    // airframe), a deteccao simplesmente nao roda — nao ha limite fisico
+    // util aqui pelo mesmo motivo do LiDAR para baixo (saturacao no maximo
+    // e indistinguivel de ataque empurrando para fora da faixa).
+    if (report.orientation == distance_sensor_s::ROTATION_FORWARD_FACING) {
+
+        if (_attack_mitigation_enabled) {
+
+            const bool vio_att_recent =
+                _vio_heading_valid &&
+                (timestamp >= _vio_heading_us) &&
+                ((timestamp - _vio_heading_us) <= MAG_VIO_MAX_AGE_US);
+
+            const bool vio_near_level =
+                vio_att_recent &&
+                (fabsf(_vio_roll_rad) < LIDAR_FRONT_MAX_TILT_RAD) &&
+                (fabsf(_vio_pitch_rad) < LIDAR_FRONT_MAX_TILT_RAD);
+
+            const bool depth_cam_recent =
+                vio_near_level &&
+                _depth_cam_distance_valid &&
+                (timestamp >= _depth_cam_distance_timestamp) &&
+                ((timestamp - _depth_cam_distance_timestamp) <= LIDAR_FRONT_DEPTH_MAX_AGE_US) &&
+                PX4_ISFINITE(_depth_cam_distance_m);
+
+            double residual = 0.0;
+            bool sample_anomalous = false;
+
+            if (depth_cam_recent) {
+                residual = static_cast<double>(report.current_distance) - static_cast<double>(_depth_cam_distance_m);
+                sample_anomalous = fabs(residual) > LIDAR_FRONT_RESIDUAL_THRESHOLD_M;
+            }
+
+            if (!sample_anomalous) {
+
+                if (_lidar_front_anomaly_active) {
+                    if (_lidar_front_recovery_start_us == 0) {
+                        _lidar_front_recovery_start_us = timestamp;
+
+                    } else if ((timestamp - _lidar_front_recovery_start_us) >= LIDAR_FRONT_RECOVERY_CONFIRM_US) {
+                        _lidar_front_anomaly_active = false;
+                        _lidar_front_anomaly_start_us = 0;
+                        _lidar_front_mitig_diag_count = 0;
+
+                        PX4_INFO("\n[LidarFront-Mitig] Sensor anomaly cleared\n");
+                    }
+                }
+
+            } else {
+                _lidar_front_recovery_start_us = 0;
+
+                if (_lidar_front_anomaly_start_us == 0) {
+                    _lidar_front_anomaly_start_us = timestamp;
+                }
+
+                if (!_lidar_front_anomaly_active &&
+                        ((timestamp - _lidar_front_anomaly_start_us) >= LIDAR_FRONT_ANOMALY_CONFIRM_US)) {
+                    _lidar_front_anomaly_active = true;
+
+                    PX4_WARN("\n[LidarFront-Mitig] Sensor anomaly detected | dist=%.2f m | depth_cam=%.2f m | residual=%.2f m\n",
+                        static_cast<double>(report.current_distance),
+                        static_cast<double>(_depth_cam_distance_m),
+                        residual);
+                }
+
+                // Substitui pela leitura da camera de profundidade,
+                // preservando os limites fisicos do sensor. So corrige
+                // quando a camera esta disponivel e recente; sem isso,
+                // deixa a leitura crua passar.
+                if (_lidar_front_anomaly_active && depth_cam_recent) {
+                    report.current_distance = static_cast<float>(math::constrain(
+                        static_cast<double>(_depth_cam_distance_m),
+                        static_cast<double>(report.min_distance),
+                        static_cast<double>(report.max_distance)));
+                }
+
+                if (_lidar_front_anomaly_active && (_lidar_front_mitig_diag_count < LIDAR_FRONT_MITIG_DIAG_MAX_COUNT)) {
+                    static uint64_t lidar_front_mitig_diag_last_us = 0;
+
+                    if ((timestamp - lidar_front_mitig_diag_last_us) > 1000000ULL) {
+                        lidar_front_mitig_diag_last_us = timestamp;
+                        _lidar_front_mitig_diag_count++;
+
+                        PX4_INFO("\n[LidarFront-Mitig] Status | dist=%.2f m | residual=%.2f m | depth_cam=%s\n",
+                            static_cast<double>(report.current_distance),
+                            residual,
+                            depth_cam_recent ? "ok" : "stale");
+
+                        if (_lidar_front_mitig_diag_count == LIDAR_FRONT_MITIG_DIAG_MAX_COUNT) {
+                            PX4_WARN("\n[LidarFront-Mitig] Check: listener distance_sensor (front, inst 1)\n");
+                        }
+                    }
+                }
+            }
+        }
+    }
+    // ======== MITIGACAO LIDAR FRONTAL - FIM ========
+
+    if (touchdown_range_sensor && PX4_ISFINITE(report.current_distance)) {
         // This callback is subscribed to the vertical rangefinder topic.
         // Accept CUSTOM orientation as a valid Gazebo-mounted rangefinder.
         _ground_distance_m = report.current_distance;
@@ -4103,7 +4609,28 @@ void GZBridge::laserScantoLidarSensorCallback(const gz::msgs::LaserScan &msg)
         _ground_distance_timestamp = report.timestamp;
     }
 
-    _distance_sensor_pub.publish(report);
+    if (is_front_slot) {
+        _distance_sensor_front_pub.publish(report);
+
+    } else {
+        _distance_sensor_pub.publish(report);
+    }
+}
+
+// Callback da inscricao "down" (subscribeDistanceSensor). Em modelos com um
+// unico sensor de distancia (down ou front), e essa inscricao quem recebe
+// os dados, independente da orientacao fisica real do sensor.
+void GZBridge::laserScantoLidarSensorCallback(const gz::msgs::LaserScan &msg)
+{
+    laserScantoLidarSensorCallbackImpl(msg, false);
+}
+
+// Callback da inscricao "front" adicional (subscribeDistanceSensorFront),
+// usada apenas em modelos combinados (ex.: x500_uavjamsim) que tem down e
+// front simultaneamente em links/sensores com nomes distintos.
+void GZBridge::laserScantoLidarSensorFrontCallback(const gz::msgs::LaserScan &msg)
+{
+    laserScantoLidarSensorCallbackImpl(msg, true);
 }
 
 // Converte o LaserScan 2D em setores de distancia para prevencao de colisao.
@@ -4134,6 +4661,15 @@ void GZBridge::laserScanCallback(const gz::msgs::LaserScan &msg)
             if (isinf(distance)) {
                 continue;
             }
+
+            // ======== ATAQUE LIDAR 2D - INICIO ========
+            // Reaproveita o mesmo comando/estado do ataque do LiDAR 1D
+            // (--lidar 1 <offset>): soma o offset a cada feixe valido antes
+            // da reducao em setores.
+            if (_lidar_attack_option == 1) {
+                distance += _lidar_distance_offset;
+            }
+            // ======== ATAQUE LIDAR - FIM ========
 
             sum += distance;
             samples_used_in_sector++;
@@ -4167,20 +4703,179 @@ void GZBridge::laserScanCallback(const gz::msgs::LaserScan &msg)
     // Inverte a ordem para converter o scan de FLU para FRD.
     for (std::vector<double>::reverse_iterator i = ds_array.rbegin(); i != ds_array.rend(); ++i) {
 
-        uint16_t distance_cm = (*i) * 100.;
+        // A comparacao de limites e feita em double, antes de qualquer
+        // conversao para uint16_t. O ataque pode empurrar a leitura para um
+        // valor negativo (offset negativo maior que a distancia real); um
+        // double negativo convertido direto para uint16_t "estoura" e vira
+        // um numero grande, caindo por acidente na faixa de "nada
+        // detectado" — o oposto do que deveria significar fisicamente (algo
+        // muito perto e o cenario mais critico para prevencao de colisao,
+        // nao deve nunca ser confundido com ausencia de obstaculo).
+        const double distance_cm_d = (*i) * 100.;
 
-        if (distance_cm >= report.max_distance) {
+        if (!PX4_ISFINITE(distance_cm_d) || (distance_cm_d >= static_cast<double>(report.max_distance))) {
             report.distances[index] = report.max_distance + 1;
 
-        } else if (distance_cm < report.min_distance) {
+        } else if (distance_cm_d < static_cast<double>(report.min_distance)) {
             report.distances[index] = 0;
 
         } else {
-            report.distances[index] = distance_cm;
+            report.distances[index] = static_cast<uint16_t>(distance_cm_d);
         }
 
         index++;
     }
+
+    // ======== MITIGACAO LIDAR 2D - INICIO ========
+    // Compara os setores dentro do alcance da camera de profundidade
+    // (OakD-Lite, so presente no x500_uavjamsim) contra a leitura
+    // publicada, usando o residuo MEDIO entre os setores comparaveis (nao
+    // um unico setor) — o ataque aplica o mesmo offset constante a todo o
+    // scan de uma vez, entao concordancia entre varios setores da mais
+    // confianca que um so. Fora da faixa coberta pela camera nao ha
+    // nenhuma referencia independente disponivel nesse modelo: esses
+    // setores permanecem sem protecao — limitacao fisica real, nao lacuna
+    // de implementacao (mesma razao ja documentada na mitigacao do LiDAR
+    // frontal).
+    if (_attack_mitigation_enabled) {
+
+        const bool vio_att_recent =
+            _vio_heading_valid &&
+            (report.timestamp >= _vio_heading_us) &&
+            ((report.timestamp - _vio_heading_us) <= MAG_VIO_MAX_AGE_US);
+
+        const bool vio_near_level =
+            vio_att_recent &&
+            (fabsf(_vio_roll_rad) < LIDAR2D_MAX_TILT_RAD) &&
+            (fabsf(_vio_pitch_rad) < LIDAR2D_MAX_TILT_RAD);
+
+        const bool depth_sectors_recent =
+            vio_near_level &&
+            _depth_cam_sector_valid &&
+            (report.timestamp >= _depth_cam_sector_timestamp) &&
+            ((report.timestamp - _depth_cam_sector_timestamp) <= LIDAR2D_DEPTH_MAX_AGE_US);
+
+        const int front_index = static_cast<int>(lroundf(-report.angle_offset / report.increment));
+        const int distances_len = static_cast<int>(sizeof(report.distances) / sizeof(report.distances[0]));
+
+        double residual_sum = 0.0;
+        int residual_count = 0;
+
+        if (depth_sectors_recent) {
+            for (int k = -LIDAR2D_DEPTH_COVERAGE_HALF_SECTORS; k <= LIDAR2D_DEPTH_COVERAGE_HALF_SECTORS; k++) {
+                const int idx = front_index + k;
+
+                if (idx < 0 || idx >= distances_len) {
+                    continue;
+                }
+
+                const float cam_depth = _depth_cam_sector_distance_m[k + LIDAR2D_DEPTH_COVERAGE_HALF_SECTORS];
+
+                if (!PX4_ISFINITE(cam_depth)) {
+                    continue;
+                }
+
+                // So compara setores com leitura real do lidar (pula o
+                // sentinela de "nada detectado"; "muito perto" (0) entra na
+                // comparacao normalmente, ja que carrega informacao real).
+                if (report.distances[idx] > report.max_distance) {
+                    continue;
+                }
+
+                const double lidar_m = static_cast<double>(report.distances[idx]) / 100.0;
+                const double residual = lidar_m - static_cast<double>(cam_depth);
+
+                residual_sum += fabs(residual);
+                residual_count++;
+            }
+        }
+
+        const bool enough_data = residual_count >= LIDAR2D_MIN_VALID_SECTORS;
+        const bool sample_anomalous = enough_data &&
+            ((residual_sum / residual_count) > LIDAR2D_RESIDUAL_THRESHOLD_M);
+
+        if (!sample_anomalous) {
+
+            if (_lidar2d_anomaly_active) {
+                if (_lidar2d_recovery_start_us == 0) {
+                    _lidar2d_recovery_start_us = report.timestamp;
+
+                } else if ((report.timestamp - _lidar2d_recovery_start_us) >= LIDAR2D_RECOVERY_CONFIRM_US) {
+                    _lidar2d_anomaly_active = false;
+                    _lidar2d_anomaly_start_us = 0;
+                    _lidar2d_mitig_diag_count = 0;
+
+                    PX4_INFO("\n[Lidar2D-Mitig] Sensor anomaly cleared\n");
+                }
+            }
+
+        } else {
+            _lidar2d_recovery_start_us = 0;
+
+            if (_lidar2d_anomaly_start_us == 0) {
+                _lidar2d_anomaly_start_us = report.timestamp;
+            }
+
+            if (!_lidar2d_anomaly_active &&
+                    ((report.timestamp - _lidar2d_anomaly_start_us) >= LIDAR2D_ANOMALY_CONFIRM_US)) {
+                _lidar2d_anomaly_active = true;
+
+                PX4_WARN("\n[Lidar2D-Mitig] Sensor anomaly detected | residual_avg=%.2f m | setores=%d\n",
+                    residual_sum / residual_count, residual_count);
+            }
+
+            // Substitui cada setor coberto pela leitura da camera,
+            // respeitando os limites do sensor. So corrige os setores onde
+            // a camera tem leitura valida; os demais (mesmo dentro da
+            // faixa coberta) ficam com a leitura crua.
+            if (_lidar2d_anomaly_active && depth_sectors_recent) {
+                for (int k = -LIDAR2D_DEPTH_COVERAGE_HALF_SECTORS; k <= LIDAR2D_DEPTH_COVERAGE_HALF_SECTORS; k++) {
+                    const int idx = front_index + k;
+
+                    if (idx < 0 || idx >= distances_len) {
+                        continue;
+                    }
+
+                    const float cam_depth = _depth_cam_sector_distance_m[k + LIDAR2D_DEPTH_COVERAGE_HALF_SECTORS];
+
+                    if (!PX4_ISFINITE(cam_depth)) {
+                        continue;
+                    }
+
+                    const double cam_cm = static_cast<double>(cam_depth) * 100.0;
+
+                    if (cam_cm >= static_cast<double>(report.max_distance)) {
+                        report.distances[idx] = report.max_distance + 1;
+
+                    } else if (cam_cm < static_cast<double>(report.min_distance)) {
+                        report.distances[idx] = 0;
+
+                    } else {
+                        report.distances[idx] = static_cast<uint16_t>(cam_cm);
+                    }
+                }
+            }
+
+            if (_lidar2d_anomaly_active && (_lidar2d_mitig_diag_count < LIDAR2D_MITIG_DIAG_MAX_COUNT)) {
+                static uint64_t lidar2d_mitig_diag_last_us = 0;
+
+                if ((report.timestamp - lidar2d_mitig_diag_last_us) > 1000000ULL) {
+                    lidar2d_mitig_diag_last_us = report.timestamp;
+                    _lidar2d_mitig_diag_count++;
+
+                    PX4_INFO("\n[Lidar2D-Mitig] Status | residual_avg=%.2f m | setores=%d | depth_cam=%s\n",
+                        enough_data ? (residual_sum / residual_count) : -1.0,
+                        residual_count,
+                        depth_sectors_recent ? "ok" : "stale");
+
+                    if (_lidar2d_mitig_diag_count == LIDAR2D_MITIG_DIAG_MAX_COUNT) {
+                        PX4_WARN("\n[Lidar2D-Mitig] Check: listener obstacle_distance (front sectors)\n");
+                    }
+                }
+            }
+        }
+    }
+    // ======== MITIGACAO LIDAR 2D - FIM ========
 
     _obstacle_distance_pub.publish(report);
 }

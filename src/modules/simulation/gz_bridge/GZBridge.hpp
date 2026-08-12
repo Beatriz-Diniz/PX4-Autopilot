@@ -83,6 +83,7 @@
 #include <gz/msgs/laserscan.pb.h>
 #include <gz/msgs/stringmsg.pb.h>
 #include <gz/msgs/scene.pb.h>
+#include <gz/msgs/image.pb.h>
 // Custom PX4 proto
 #include <opticalflow.pb.h>
 #include <gz/msgs/int32.pb.h>
@@ -121,6 +122,11 @@ private:
     bool subscribeOdometry(bool required);
     bool subscribeLaserScan(bool required);
     bool subscribeDistanceSensor(bool required);
+    // Inscricao adicional para o LiDAR frontal em modelos combinados (ex.:
+    // x500_uavjamsim), onde down e front usam links/sensores com nomes
+    // distintos. Reaproveita o mesmo callback de laserScantoLidarSensorCallback.
+    bool subscribeDistanceSensorFront(bool required);
+    bool subscribeDepthCamera(bool required);
     bool subscribeAirspeed(bool required);
     bool subscribeAirPressure(bool required);
     bool subscribeNavsat(bool required);
@@ -135,7 +141,6 @@ private:
     void magAttackCallback(const gz::msgs::Vector3d &msg);
     void lidarAttackCallback(const gz::msgs::Vector3d &msg);
     void streamAttackCallback(const gz::msgs::Int32 &msg);
-    void sonarAttackCallback(const gz::msgs::Vector3d &msg);
     void baroAttackCallback(const gz::msgs::Vector3d &msg);
 
     // Ataques de jamming GPS
@@ -151,7 +156,15 @@ private:
     void poseInfoCallback(const gz::msgs::Pose_V &msg);
     void odometryCallback(const gz::msgs::OdometryWithCovariance &msg);
     void navSatCallback(const gz::msgs::NavSat &msg);
+    void laserScantoLidarSensorCallbackImpl(const gz::msgs::LaserScan &msg, bool is_front_slot);
     void laserScantoLidarSensorCallback(const gz::msgs::LaserScan &msg);
+    void laserScantoLidarSensorFrontCallback(const gz::msgs::LaserScan &msg);
+    void depthCameraCallback(const gz::msgs::Image &msg);
+    // Amostra a profundidade media de um patch NxN pixels ao redor de (cx,
+    // cy) na imagem de profundidade. Retorna NAN se nenhum pixel valido foi
+    // encontrado na janela. Reaproveitado tanto para a leitura central
+    // (LiDAR frontal) quanto para a varredura por setor (LiDAR 2D).
+    static float samplePatchDepth(const gz::msgs::Image &msg, int cx, int cy, int patch_half);
     void laserScanCallback(const gz::msgs::LaserScan &msg);
     void opticalFlowCallback(const px4::msgs::OpticalFlow &msg);
     void magnetometerCallback(const gz::msgs::Magnetometer &msg);
@@ -203,6 +216,20 @@ private:
     void checkMagAutoLand(uint64_t timestamp);
     void checkMagAutoDisarm(uint64_t timestamp);
 
+    // Pouso/desarme para a mitigacao de LiDAR (wrapper sobre o molde generico).
+    void checkLidarAutoLand(uint64_t timestamp);
+    void checkLidarAutoDisarm(uint64_t timestamp);
+
+    // Pouso/desarme para a mitigacao de LiDAR frontal (wrapper sobre o
+    // molde generico).
+    void checkLidarFrontAutoLand(uint64_t timestamp);
+    void checkLidarFrontAutoDisarm(uint64_t timestamp);
+
+    // Pouso/desarme para a mitigacao de LiDAR 2D (wrapper sobre o molde
+    // generico).
+    void checkLidar2dAutoLand(uint64_t timestamp);
+    void checkLidar2dAutoDisarm(uint64_t timestamp);
+
     static void rotateQuaternion(gz::math::Quaterniond &q_FRD_to_NED, const gz::math::Quaterniond q_FLU_to_ENU);
 
     static float generate_wgn();
@@ -213,6 +240,11 @@ private:
     uORB::SubscriptionInterval                    _parameter_update_sub{ORB_ID(parameter_update), 1_s};
 
     uORB::Publication<distance_sensor_s>          _distance_sensor_pub{ORB_ID(distance_sensor)};
+    // Instancia separada para o LiDAR frontal em modelos combinados (ex.:
+    // x500_uavjamsim), que tem down e front simultaneamente com nomes de
+    // link/sensor distintos. Sem isso, os dois publicariam na mesma
+    // instancia unica de _distance_sensor_pub, um sobrescrevendo o outro.
+    uORB::PublicationMulti<distance_sensor_s>     _distance_sensor_front_pub{ORB_ID(distance_sensor)};
     uORB::Publication<differential_pressure_s>    _differential_pressure_pub{ORB_ID(differential_pressure)};
     uORB::Publication<obstacle_distance_s>        _obstacle_distance_pub{ORB_ID(obstacle_distance)};
     uORB::Publication<vehicle_angular_velocity_s> _angular_velocity_ground_truth_pub{ORB_ID(vehicle_angular_velocity_groundtruth)};
@@ -377,7 +409,6 @@ private:
     // ======== MITIGACAO MOTOR - FIM ========
 
     // ======== MITIGACAO MAGNETOMETRO - ESTADO ========
-    bool _mag_ever_armed{false};
 
     // Atitude da VIO (referencia independente do magnetometro), atualizada em
     // odometryCallback. So o heading (yaw) e usado no calculo; roll/pitch sao
@@ -447,6 +478,158 @@ private:
     uint32_t _mag_sim_agl_ground_count{0};
     // ======== MITIGACAO MAGNETOMETRO - FIM ========
 
+    // ======== MITIGACAO LIDAR - ESTADO ========
+
+    // Ancora entre a leitura do LiDAR e a altitude do barometro, calibrada a
+    // partir das primeiras amostras saudaveis (mesmo padrao de warmup do
+    // magnetometro). Usa o barometro, nao a VIO, porque este airframe
+    // (lidar_down) nao tem VIO/odometria visual confiavel disponivel — o
+    // barometro e a unica referencia de altitude genuinamente independente
+    // do LiDAR presente em todo airframe. O ataque de LiDAR e um offset
+    // constante, que uma comparacao por taxa de variacao nunca pegaria (o
+    // offset se cancela na diferenca entre duas amostras): so uma comparacao
+    // por valor absoluto contra essa ancora detecta. Isso assume terreno
+    // localmente plano perto do ponto de calibracao — sobrevoar uma
+    // elevacao bem diferente da do momento da calibracao gera divergencia
+    // legitima, nao deteccao de ataque.
+    bool     _lidar_baseline_initialized{false};
+    uint32_t _lidar_baseline_warmup_count{0};
+    double   _lidar_anchor_offset_m{0.0}; // distancia_lida - altitude_baro, na calibracao
+    static constexpr uint32_t LIDAR_BASELINE_WARMUP_SAMPLES = 30;
+    static constexpr double   LIDAR_BASELINE_WARMUP_ALPHA   = 0.25;
+    static constexpr double   LIDAR_BASELINE_ALPHA          = 0.01;
+
+    bool     _lidar_anomaly_active{false};
+    uint64_t _lidar_anomaly_start_us{0};
+    uint64_t _lidar_recovery_start_us{0};
+    uint32_t _lidar_mitig_diag_count{0};
+    static constexpr uint32_t LIDAR_MITIG_DIAG_MAX_COUNT = 3;
+
+    // Faixa fisica do LiDAR (LW20/C), igual ao configurado no SDF do
+    // sensor (Tools/simulation/gz/models/x500_lidar_down|front/model.sdf).
+    static constexpr float LIDAR_RANGE_MIN_M = 0.1f;
+    static constexpr float LIDAR_RANGE_MAX_M = 100.0f;
+    // Residuo maximo tolerado entre a leitura e o valor esperado pela ancora.
+    static constexpr double LIDAR_RESIDUAL_THRESHOLD_M = 1.2;
+    static constexpr uint64_t LIDAR_ANOMALY_CONFIRM_US        = 1500000ULL; // 1.5 s
+    static constexpr uint64_t LIDAR_ANOMALY_CONFIRM_SEVERE_US = 20000ULL;   // 20 ms
+    static constexpr uint64_t LIDAR_RECOVERY_CONFIRM_US       = 500000ULL;  // 500 ms
+    static constexpr uint64_t LIDAR_BARO_MAX_AGE_US           = 800000ULL;  // 800 ms
+
+    // Pouso automatico mitigado por anomalia de LiDAR.
+    bool     _lidar_landing_active{false};
+    bool     _lidar_auto_land_sent{false};
+    bool     _lidar_auto_disarm_sent{false};
+    uint64_t _lidar_auto_land_arrival_us{0};
+    uint64_t _lidar_auto_land_last_arrived_us{0};
+    double   _lidar_land_hold_n_m{0.0};
+    double   _lidar_land_hold_e_m{0.0};
+    uint32_t _lidar_sim_agl_ground_count{0};
+    // ======== MITIGACAO LIDAR - FIM ========
+
+    // ======== MITIGACAO LIDAR FRONTAL - ESTADO ========
+    // Cache da leitura central da camera de profundidade (OakD-Lite, so
+    // presente no x500_uavjamsim), usada como referencia independente do
+    // LiDAR frontal. Diferente da mitigacao do LiDAR para baixo, aqui os
+    // dois sensores medem a mesma coisa em tempo real (nao e um offset
+    // constante que se cancela na diferenca entre amostras), entao nao
+    // precisa de ancora/calibracao — e uma comparacao direta.
+    bool     _depth_cam_distance_valid{false};
+    uint64_t _depth_cam_distance_timestamp{0};
+    float    _depth_cam_distance_m{NAN};
+    static constexpr uint64_t LIDAR_FRONT_DEPTH_MAX_AGE_US = 300000ULL; // 300 ms
+
+    bool     _lidar_front_anomaly_active{false};
+    uint64_t _lidar_front_anomaly_start_us{0};
+    uint64_t _lidar_front_recovery_start_us{0};
+    uint32_t _lidar_front_mitig_diag_count{0};
+    static constexpr uint32_t LIDAR_FRONT_MITIG_DIAG_MAX_COUNT = 3;
+
+    // Residuo maximo tolerado entre LiDAR e camera de profundidade (folga
+    // para o offset fisico/paralaxe entre os dois sensores no corpo).
+    static constexpr double LIDAR_FRONT_RESIDUAL_THRESHOLD_M     = 1.0;
+    // Inclinacao maxima para confiar na comparacao. Os dois sensores tem a
+    // MESMA direcao (confirmado via geometria do SDF: 0 graus de diferenca
+    // angular), mas ficam a ~36cm de diferenca de altura no corpo (lidar
+    // frontal bem baixo, camera bem mais alta, montada sobre o LiDAR 2D).
+    // Em espaco aberto e nivelado, um raio horizontal nunca cruza o chao;
+    // qualquer inclinacao residual, por menor que seja, faz o raio
+    // eventualmente cruzar o chao a uma distancia que cresce conforme a
+    // inclinacao diminui (relacao de tangente) — e a diferenca de altura
+    // entre os sensores amplifica isso em divergencia real entre as duas
+    // leituras, sem nenhum ataque envolvido. O limite aqui e bem mais
+    // apertado que o do magnetometro (MAG_MAX_TILT_RAD) de proposito: por
+    // essa relacao de tangente, mesmo uma inclinacao pequena ja e
+    // suficiente para gerar residuo grande a media/longa distancia.
+    static constexpr float LIDAR_FRONT_MAX_TILT_RAD = 0.05f; // ~3 graus
+    static constexpr uint64_t LIDAR_FRONT_ANOMALY_CONFIRM_US        = 500000ULL; // 500 ms
+    static constexpr uint64_t LIDAR_FRONT_ANOMALY_CONFIRM_SEVERE_US = 20000ULL;  // 20 ms
+    static constexpr uint64_t LIDAR_FRONT_RECOVERY_CONFIRM_US       = 500000ULL; // 500 ms
+
+    // Pouso automatico mitigado por anomalia de LiDAR frontal.
+    bool     _lidar_front_landing_active{false};
+    bool     _lidar_front_auto_land_sent{false};
+    bool     _lidar_front_auto_disarm_sent{false};
+    uint64_t _lidar_front_auto_land_arrival_us{0};
+    uint64_t _lidar_front_auto_land_last_arrived_us{0};
+    double   _lidar_front_land_hold_n_m{0.0};
+    double   _lidar_front_land_hold_e_m{0.0};
+    uint32_t _lidar_front_sim_agl_ground_count{0};
+    // ======== MITIGACAO LIDAR FRONTAL - FIM ========
+
+    // ======== MITIGACAO LIDAR 2D - ESTADO ========
+    // Cache de profundidade por setor (mesma camera OakD-Lite do LiDAR
+    // frontal, amostrada em varias colunas da imagem em vez de so o centro).
+    // Cobre uma faixa de setores em torno da direcao frontal (indice
+    // correspondente a 0 graus no referencial do corpo), usando o campo de
+    // visao horizontal conhecido da camera para projetar cada angulo de
+    // setor na coluna de pixel correspondente. So cobre uma fatia do scan
+    // de 270 graus: fora dessa faixa nao ha nenhuma referencia independente
+    // disponivel nesse modelo (mesma limitacao ja documentada no LiDAR
+    // frontal), e a distancia de montagem entre lidar e camera introduz erro
+    // de paralaxe que cresce em direcao as bordas do campo de visao — a
+    // tolerancia de residuo (abaixo) e mais larga que a do LiDAR frontal por
+    // causa disso.
+    static constexpr int LIDAR2D_DEPTH_COVERAGE_HALF_SECTORS = 7; // +-7 setores (~+-35 graus)
+    static constexpr int LIDAR2D_DEPTH_COVERAGE_COUNT = 2 * LIDAR2D_DEPTH_COVERAGE_HALF_SECTORS + 1;
+    static constexpr uint64_t LIDAR2D_DEPTH_MAX_AGE_US = 300000ULL; // 300 ms
+
+    float    _depth_cam_sector_distance_m[LIDAR2D_DEPTH_COVERAGE_COUNT] = {};
+    bool     _depth_cam_sector_valid{false};
+    uint64_t _depth_cam_sector_timestamp{0};
+
+    bool     _lidar2d_anomaly_active{false};
+    uint64_t _lidar2d_anomaly_start_us{0};
+    uint64_t _lidar2d_recovery_start_us{0};
+    uint32_t _lidar2d_mitig_diag_count{0};
+    static constexpr uint32_t LIDAR2D_MITIG_DIAG_MAX_COUNT = 3;
+
+    // Residuo medio maximo tolerado entre os setores do LiDAR 2D e a
+    // referencia da camera (mais largo que o do LiDAR frontal por causa da
+    // paralaxe crescente nas bordas da faixa coberta). Exige um numero
+    // minimo de setores comparaveis para nao decidir com base em pouco dado.
+    static constexpr double LIDAR2D_RESIDUAL_THRESHOLD_M = 1.5;
+    // Mesma logica de inclinacao maxima do LiDAR frontal (ver comentario
+    // detalhado la): a relacao de tangente entre inclinacao residual e
+    // distancia ate o chao amplifica a diferenca de altura entre os
+    // sensores, entao mesmo uma inclinacao pequena ja basta para gerar
+    // residuo grande sem ataque nenhum — por isso o limite e apertado.
+    static constexpr float LIDAR2D_MAX_TILT_RAD = 0.05f; // ~3 graus
+    static constexpr int    LIDAR2D_MIN_VALID_SECTORS     = 3;
+    static constexpr uint64_t LIDAR2D_ANOMALY_CONFIRM_US    = 500000ULL; // 500 ms
+    static constexpr uint64_t LIDAR2D_RECOVERY_CONFIRM_US   = 500000ULL; // 500 ms
+
+    // Pouso automatico mitigado por anomalia de LiDAR 2D.
+    bool     _lidar2d_landing_active{false};
+    bool     _lidar2d_auto_land_sent{false};
+    bool     _lidar2d_auto_disarm_sent{false};
+    uint64_t _lidar2d_auto_land_arrival_us{0};
+    uint64_t _lidar2d_auto_land_last_arrived_us{0};
+    double   _lidar2d_land_hold_n_m{0.0};
+    double   _lidar2d_land_hold_e_m{0.0};
+    uint32_t _lidar2d_sim_agl_ground_count{0};
+    // ======== MITIGACAO LIDAR 2D - FIM ========
+
     // Ataque de magnetometro
     int _mag_attack_option{0};
 
@@ -457,10 +640,6 @@ private:
     // Ataque de stream
     int _stream_attack_option{0};
     gz::transport::Node::Publisher _stream_cmd_pub;
-
-    // Ataque de sonar
-    int _sonar_attack_option{0};
-    double _sonar_distance_offset{0.0};
 
     // Ataque de barometro
     int _baro_attack_option{0};
