@@ -331,13 +331,13 @@ bool GZBridge::subscribeDistanceSensorFront(bool required)
 //
 // Usa o nome de topico FIXO ("/depth_camera", definido pela tag <topic> no
 // sensor StereoOV7251 do model.sdf), nao o caminho hierarquico automatico
-// (/world/.../sensor/StereoOV7251/depth_image). Confirmado empiricamente
-// que o sensor "depth_camera" do Gazebo so publica de fato no topico fixo
-// quando a tag <topic> esta presente no SDF — o caminho hierarquico
-// aparece listado (gz topic -l) mas nunca tem publicador ativo. Isso NAO
-// e um problema de driver/GPU: a mesma maquina publica normalmente assim
-// que o topico fixo e usado. Se o nome do topico no SDF mudar, essa
-// string precisa mudar junto.
+// (/world/.../sensor/StereoOV7251/depth_image). O sensor "depth_camera" do
+// Gazebo so publica de fato no topico fixo quando a tag <topic> esta
+// presente no SDF — o caminho hierarquico aparece listado (gz topic -l)
+// mas nunca tem publicador ativo para esse tipo de sensor. Nao e limitacao
+// de driver/GPU: a mesma maquina publica normalmente assim que o topico
+// fixo e usado. Se o nome do topico no SDF mudar, essa string precisa
+// mudar junto.
 //
 // Limitacao conhecida: por ser um nome fixo (nao escopado por mundo ou
 // instancia de modelo), isso so funciona corretamente com um unico
@@ -864,6 +864,23 @@ void GZBridge::attackMitigationCallback(const gz::msgs::Vector3d &msg)
     _lidar2d_land_hold_e_m = 0.0;
     _lidar2d_sim_agl_ground_count = 0;
 
+    // Reinicia o estado da mitigacao de barometro (deteccao, ancora, pouso).
+    _baro_baseline_initialized = false;
+    _baro_baseline_warmup_count = 0;
+    _baro_anchor_offset_m = 0.0;
+    _baro_anomaly_active = false;
+    _baro_anomaly_start_us = 0;
+    _baro_recovery_start_us = 0;
+    _baro_mitig_diag_count = 0;
+    _baro_landing_active = false;
+    _baro_auto_land_sent = false;
+    _baro_auto_disarm_sent = false;
+    _baro_auto_land_arrival_us = 0;
+    _baro_auto_land_last_arrived_us = 0;
+    _baro_land_hold_n_m = 0.0;
+    _baro_land_hold_e_m = 0.0;
+    _baro_sim_agl_ground_count = 0;
+
     if (_attack_mitigation_enabled) {
         PX4_WARN("\n[Mitigation] KF-Jamming mitigation ENABLED\n");
     } else {
@@ -1179,6 +1196,145 @@ void GZBridge::airPressureCallback(const gz::msgs::FluidPressure &msg)
         report.temperature = raw_temperature;
     }
     // ======== ATAQUE BAROMETRO - FIM ========
+
+    // ======== MITIGACAO BAROMETRO - INICIO ========
+    // Deteccao de anomalia na altitude implicita na pressao publicada, sem
+    // consultar _baro_attack_option: divergencia contra o valor esperado
+    // por uma ancora entre essa altitude e a altitude do GPS (referencia
+    // independente), calibrada a partir das primeiras amostras saudaveis.
+    // O ataque e um offset constante de altitude, que uma comparacao por
+    // taxa de variacao nunca pegaria (o offset se cancela na diferenca
+    // entre amostras): so uma comparacao por valor absoluto contra essa
+    // ancora detecta.
+    if (_attack_mitigation_enabled) {
+
+        constexpr float P0 = 101325.0f;
+        constexpr float T0 = 288.15f;
+        constexpr float L  = 0.0065f;
+        constexpr float EXP = 0.190263f;
+
+        const float P_published = report.pressure;
+        const bool pressure_valid =
+            PX4_ISFINITE(P_published) && P_published > 1000.0f && P_published < 120000.0f;
+
+        double baro_alt_from_report = NAN;
+
+        if (pressure_valid) {
+            baro_alt_from_report =
+                (static_cast<double>(T0) / static_cast<double>(L)) *
+                (1.0 - pow(static_cast<double>(P_published) / static_cast<double>(P0), static_cast<double>(EXP)));
+        }
+
+        const bool gps_alt_recent =
+            _gps_real_valid &&
+            (timestamp >= _gps_real_alt_timestamp) &&
+            ((timestamp - _gps_real_alt_timestamp) <= BARO_GPS_ALT_MAX_AGE_US) &&
+            PX4_ISFINITE(_gps_real_alt);
+
+        double residual = 0.0;
+        bool sample_anomalous = false;
+
+        if (gps_alt_recent && pressure_valid && _baro_baseline_initialized) {
+            const double expected_alt = _baro_anchor_offset_m + _gps_real_alt;
+            residual = baro_alt_from_report - expected_alt;
+            sample_anomalous = fabs(residual) > BARO_RESIDUAL_THRESHOLD_M;
+        }
+
+        if (!sample_anomalous) {
+
+            // Atualiza a ancora apenas com amostras saudaveis. As primeiras
+            // amostras (warmup) calibram com um alpha mais agressivo;
+            // depois, adapta lentamente (tolera deriva legitima, mas um
+            // ataque sustentado nao chega a ser absorvido, pois so entra
+            // aqui quando a amostra nao e anomala).
+            if (gps_alt_recent && pressure_valid) {
+                const double sample_offset = baro_alt_from_report - _gps_real_alt;
+
+                if (_baro_baseline_warmup_count == 0) {
+                    _baro_anchor_offset_m = sample_offset;
+                    _baro_baseline_warmup_count = 1;
+
+                } else if (_baro_baseline_warmup_count < BARO_BASELINE_WARMUP_SAMPLES) {
+                    _baro_anchor_offset_m += BARO_BASELINE_WARMUP_ALPHA * (sample_offset - _baro_anchor_offset_m);
+                    _baro_baseline_warmup_count++;
+
+                    if (_baro_baseline_warmup_count >= BARO_BASELINE_WARMUP_SAMPLES) {
+                        _baro_baseline_initialized = true;
+                    }
+
+                } else {
+                    _baro_anchor_offset_m += BARO_BASELINE_ALPHA * (sample_offset - _baro_anchor_offset_m);
+                }
+            }
+
+            if (_baro_anomaly_active) {
+                if (_baro_recovery_start_us == 0) {
+                    _baro_recovery_start_us = timestamp;
+
+                } else if ((timestamp - _baro_recovery_start_us) >= BARO_RECOVERY_CONFIRM_US) {
+                    _baro_anomaly_active = false;
+                    _baro_anomaly_start_us = 0;
+                    _baro_mitig_diag_count = 0;
+
+                    PX4_INFO("\n[Baro-Mitig] Sensor anomaly cleared\n");
+                }
+            }
+
+        } else {
+            _baro_recovery_start_us = 0;
+
+            if (_baro_anomaly_start_us == 0) {
+                _baro_anomaly_start_us = timestamp;
+            }
+
+            if (!_baro_anomaly_active &&
+                    ((timestamp - _baro_anomaly_start_us) >= BARO_ANOMALY_CONFIRM_US)) {
+                _baro_anomaly_active = true;
+
+                PX4_WARN("\n[Baro-Mitig] Sensor anomaly detected | alt=%.2f m | residual=%.2f m\n",
+                    baro_alt_from_report, residual);
+            }
+
+            // Reconstroi a pressao a partir da altitude esperada (ancora +
+            // altitude atual do GPS), usando o mesmo modelo de atmosfera
+            // padrao ja usado para calcular altitude a partir de pressao.
+            // A temperatura publicada nunca precisa ser reconstruida: vem
+            // de this->_temperature (airspeedCallback), caminho que o
+            // ataque de barometro nunca toca.
+            if (_baro_anomaly_active && gps_alt_recent && _baro_baseline_initialized) {
+                const double expected_alt = _baro_anchor_offset_m + _gps_real_alt;
+                const double corrected_pressure =
+                    static_cast<double>(P0) *
+                    pow(1.0 - (static_cast<double>(L) * expected_alt) / static_cast<double>(T0),
+                        1.0 / static_cast<double>(EXP));
+
+                if (PX4_ISFINITE(corrected_pressure) && corrected_pressure > 1000.0 && corrected_pressure < 120000.0) {
+                    report.pressure = static_cast<float>(corrected_pressure);
+                }
+
+                report.temperature = raw_temperature;
+            }
+
+            if (_baro_anomaly_active && (_baro_mitig_diag_count < BARO_MITIG_DIAG_MAX_COUNT)) {
+                static uint64_t baro_mitig_diag_last_us = 0;
+
+                if ((timestamp - baro_mitig_diag_last_us) > 1000000ULL) {
+                    baro_mitig_diag_last_us = timestamp;
+                    _baro_mitig_diag_count++;
+
+                    PX4_INFO("\n[Baro-Mitig] Status | pressure=%.1f Pa | gps_alt=%s\n",
+                        static_cast<double>(report.pressure),
+                        residual,
+                        gps_alt_recent ? "ok" : "stale");
+
+                    if (_baro_mitig_diag_count == BARO_MITIG_DIAG_MAX_COUNT) {
+                        PX4_WARN("\n[Baro-Mitig] Check: listener sensor_baro\n");
+                    }
+                }
+            }
+        }
+    }
+    // ======== MITIGACAO BAROMETRO - FIM ========
 
     _sensor_baro_pub.publish(report);
 
@@ -2059,6 +2215,11 @@ void GZBridge::imuCallback(const gz::msgs::IMU &msg)
     checkLidar2dAutoDisarm(timestamp);
     // ======== MITIGACAO DE POUSO LIDAR 2D - FIM ========
 
+    // ======== MITIGACAO DE POUSO BAROMETRO - INICIO ========
+    checkBaroAutoLand(timestamp);
+    checkBaroAutoDisarm(timestamp);
+    // ======== MITIGACAO DE POUSO BAROMETRO - FIM ========
+
 }
 
 // ======== MITIGACAO DE POUSO GPS - INICIO ========
@@ -2918,6 +3079,21 @@ void GZBridge::checkLidar2dAutoDisarm(uint64_t timestamp)
         _lidar2d_auto_disarm_sent, _lidar2d_sim_agl_ground_count, "Lidar2D");
 }
 // ======== MITIGACAO DE POUSO LIDAR 2D - FIM ========
+
+// ======== MITIGACAO DE POUSO BAROMETRO - INICIO ========
+void GZBridge::checkBaroAutoLand(uint64_t timestamp)
+{
+    checkGenericAnomalyAutoLand(timestamp, _baro_anomaly_active, _baro_landing_active,
+        _baro_auto_land_sent, _baro_auto_land_arrival_us, _baro_auto_land_last_arrived_us,
+        _baro_land_hold_n_m, _baro_land_hold_e_m, "Baro");
+}
+
+void GZBridge::checkBaroAutoDisarm(uint64_t timestamp)
+{
+    checkGenericAnomalyAutoDisarm(timestamp, _baro_landing_active, _baro_auto_land_sent,
+        _baro_auto_disarm_sent, _baro_sim_agl_ground_count, "Baro");
+}
+// ======== MITIGACAO DE POUSO BAROMETRO - FIM ========
 
 
 // ======== MITIGACAO BLACKOUT GPS - INICIO ========
@@ -4136,6 +4312,7 @@ void GZBridge::navSatCallback(const gz::msgs::NavSat &msg)
         _gps_real_n_m = static_cast<double>(gps_n_m);
         _gps_real_e_m = static_cast<double>(gps_e_m);
         _gps_real_alt = altitude;
+        _gps_real_alt_timestamp = timestamp;
         _gps_real_vel_n = vel_north;
         _gps_real_vel_e = vel_east;
         _gps_real_vel_d = vel_down;

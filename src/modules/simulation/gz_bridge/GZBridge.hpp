@@ -230,6 +230,11 @@ private:
     void checkLidar2dAutoLand(uint64_t timestamp);
     void checkLidar2dAutoDisarm(uint64_t timestamp);
 
+    // Pouso/desarme para a mitigacao de barometro (wrapper sobre o molde
+    // generico).
+    void checkBaroAutoLand(uint64_t timestamp);
+    void checkBaroAutoDisarm(uint64_t timestamp);
+
     static void rotateQuaternion(gz::math::Quaterniond &q_FRD_to_NED, const gz::math::Quaterniond q_FLU_to_ENU);
 
     static float generate_wgn();
@@ -548,9 +553,9 @@ private:
     // Residuo maximo tolerado entre LiDAR e camera de profundidade (folga
     // para o offset fisico/paralaxe entre os dois sensores no corpo).
     static constexpr double LIDAR_FRONT_RESIDUAL_THRESHOLD_M     = 1.0;
-    // Inclinacao maxima para confiar na comparacao. Os dois sensores tem a
-    // MESMA direcao (confirmado via geometria do SDF: 0 graus de diferenca
-    // angular), mas ficam a ~36cm de diferenca de altura no corpo (lidar
+    // Inclinacao maxima para confiar na comparacao. Os dois sensores
+    // apontam na mesma direcao (0 graus de diferenca angular pela geometria
+    // do SDF), mas ficam a ~36cm de diferenca de altura no corpo (lidar
     // frontal bem baixo, camera bem mais alta, montada sobre o LiDAR 2D).
     // Em espaco aberto e nivelado, um raio horizontal nunca cruza o chao;
     // qualquer inclinacao residual, por menor que seja, faz o raio
@@ -590,7 +595,7 @@ private:
     // de paralaxe que cresce em direcao as bordas do campo de visao — a
     // tolerancia de residuo (abaixo) e mais larga que a do LiDAR frontal por
     // causa disso.
-    static constexpr int LIDAR2D_DEPTH_COVERAGE_HALF_SECTORS = 7; // +-7 setores (~+-35 graus)
+    static constexpr int LIDAR2D_DEPTH_COVERAGE_HALF_SECTORS = 7; // +-7 setores (~+-35 graus, teste)
     static constexpr int LIDAR2D_DEPTH_COVERAGE_COUNT = 2 * LIDAR2D_DEPTH_COVERAGE_HALF_SECTORS + 1;
     static constexpr uint64_t LIDAR2D_DEPTH_MAX_AGE_US = 300000ULL; // 300 ms
 
@@ -629,6 +634,42 @@ private:
     double   _lidar2d_land_hold_e_m{0.0};
     uint32_t _lidar2d_sim_agl_ground_count{0};
     // ======== MITIGACAO LIDAR 2D - FIM ========
+
+    // ======== MITIGACAO BAROMETRO - ESTADO ========
+    // Ancora entre a altitude derivada do barometro e a altitude do GPS
+    // (referencia independente), calibrada a partir das primeiras amostras
+    // saudaveis. O ataque e um offset constante de altitude, que uma
+    // comparacao por taxa de variacao nunca pegaria (o offset se cancela na
+    // diferenca entre amostras): so uma comparacao por valor absoluto contra
+    // essa ancora detecta.
+    bool     _baro_baseline_initialized{false};
+    uint32_t _baro_baseline_warmup_count{0};
+    double   _baro_anchor_offset_m{0.0}; // altitude_barometro - altitude_gps, na calibracao
+    static constexpr uint32_t BARO_BASELINE_WARMUP_SAMPLES = 30;
+    static constexpr double   BARO_BASELINE_WARMUP_ALPHA   = 0.25;
+    static constexpr double   BARO_BASELINE_ALPHA          = 0.01;
+
+    bool     _baro_anomaly_active{false};
+    uint64_t _baro_anomaly_start_us{0};
+    uint64_t _baro_recovery_start_us{0};
+    uint32_t _baro_mitig_diag_count{0};
+    static constexpr uint32_t BARO_MITIG_DIAG_MAX_COUNT = 3;
+
+    static constexpr double BARO_RESIDUAL_THRESHOLD_M = 3.0;
+    static constexpr uint64_t BARO_ANOMALY_CONFIRM_US  = 1500000ULL; // 1.5 s
+    static constexpr uint64_t BARO_RECOVERY_CONFIRM_US = 500000ULL;  // 500 ms
+    static constexpr uint64_t BARO_GPS_ALT_MAX_AGE_US  = 1000000ULL; // 1 s
+
+    // Pouso automatico mitigado por anomalia de barometro.
+    bool     _baro_landing_active{false};
+    bool     _baro_auto_land_sent{false};
+    bool     _baro_auto_disarm_sent{false};
+    uint64_t _baro_auto_land_arrival_us{0};
+    uint64_t _baro_auto_land_last_arrived_us{0};
+    double   _baro_land_hold_n_m{0.0};
+    double   _baro_land_hold_e_m{0.0};
+    uint32_t _baro_sim_agl_ground_count{0};
+    // ======== MITIGACAO BAROMETRO - FIM ========
 
     // Ataque de magnetometro
     int _mag_attack_option{0};
@@ -809,6 +850,11 @@ private:
     double   _gps_real_n_m{0.0};
     double   _gps_real_e_m{0.0};
     double   _gps_real_alt{0.0};
+    // Timestamp proprio da altitude: _gps_real_last_us marca toda chegada de
+    // callback GPS (mesmo em ancora), mas _gps_real_alt so atualiza fora da
+    // ancora — usar _gps_real_last_us para checar frescor da altitude
+    // esconderia o caso de GPS sob ataque com a mitigacao do GPS ligada.
+    uint64_t _gps_real_alt_timestamp{0};
     float    _gps_real_vel_n{0.0f};
     float    _gps_real_vel_e{0.0f};
     float    _gps_real_vel_d{0.0f};
