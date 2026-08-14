@@ -1322,7 +1322,7 @@ void GZBridge::airPressureCallback(const gz::msgs::FluidPressure &msg)
                     baro_mitig_diag_last_us = timestamp;
                     _baro_mitig_diag_count++;
 
-                    PX4_INFO("\n[Baro-Mitig] Status | pressure=%.1f Pa | gps_alt=%s\n",
+                    PX4_INFO("\n[Baro-Mitig] Status | pressure=%.1f Pa | residual=%.2f m | gps_alt=%s\n",
                         static_cast<double>(report.pressure),
                         residual,
                         gps_alt_recent ? "ok" : "stale");
@@ -1339,8 +1339,10 @@ void GZBridge::airPressureCallback(const gz::msgs::FluidPressure &msg)
     _sensor_baro_pub.publish(report);
 
     // ======== MITIGACAO GPS - INICIO ========
-    // Cache usado pela mitigacao quando o barometro esta em estado nominal.
-    if (_baro_attack_option == 0) {
+    // Cache usado pela mitigacao quando o barometro esta em estado
+    // confiavel, decidido pela propria deteccao de anomalia do barometro
+    // (sintoma), nao pela flag de comando do ataque.
+    if (!_baro_anomaly_active) {
         constexpr float P0 = 101325.0f;
         constexpr float T0 = 288.15f;
         constexpr float L  = 0.0065f;
@@ -4303,8 +4305,14 @@ void GZBridge::navSatCallback(const gz::msgs::NavSat &msg)
     _gps_real_last_us = timestamp;
     _gps_real_valid = true;
 
-    // Os valores limpos sao atualizados apenas fora da ancora.
-    if (!is_anchor_now) {
+    // Os valores limpos sao atualizados apenas fora da ancora e fora do
+    // ruido do jamming pulsado. O ruido pulsado (tipo 3) e injetado depois
+    // que a deteccao NIS do GPS ja rodou nesta mesma chamada, entao essa
+    // deteccao nunca chega a ver esse ruido especifico — sem essa segunda
+    // checagem, o valor contaminado passaria como "limpo" para quem usa
+    // este cache como referencia independente (mitigacao de barometro,
+    // entre outras).
+    if (!is_anchor_now && !_jamming_intermittent_active) {
         float gps_n_m = 0.0f;
         float gps_e_m = 0.0f;
         _pos_ref.project(latitude, longitude, gps_n_m, gps_e_m);

@@ -757,7 +757,7 @@ private:
     static constexpr uint64_t BLACKOUT_VIO_TIMEOUT_US = 500000ULL; // 0.5 s
 
     // Tempo limite usado para identificar ausencia de atualizacoes GPS.
-    static constexpr uint64_t BLACKOUT_GPS_TIMEOUT_US = 1500000ULL; // 1.5 s
+    static constexpr uint64_t BLACKOUT_GPS_TIMEOUT_US = 500000ULL; // 500 ms
 
     // ======== POUSO AUTOMATICO GPS - CONSTANTES ========
     static constexpr float AUTO_LAND_DEST_RADIUS_M = 1.2f;
