@@ -141,6 +141,10 @@ private:
     void magAttackCallback(const gz::msgs::Vector3d &msg);
     void lidarAttackCallback(const gz::msgs::Vector3d &msg);
     void streamAttackCallback(const gz::msgs::Int32 &msg);
+    // So imprime o aviso encaminhado pelo GstCameraSystem (processo do
+    // Gazebo) quando a mitigacao de flip do stream confirma um ataque.
+    void streamFlipDetectedCallback(const gz::msgs::Int32 &msg);
+    void streamBlackDetectedCallback(const gz::msgs::Int32 &msg);
     void baroAttackCallback(const gz::msgs::Vector3d &msg);
 
     // Ataques de jamming GPS

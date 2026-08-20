@@ -37,9 +37,10 @@ project(GstCameraSystem)
 find_package(PkgConfig REQUIRED)
 pkg_check_modules(GSTREAMER gstreamer-1.0)
 pkg_check_modules(GSTREAMER_APP gstreamer-app-1.0)
+find_package(OpenCV)
 
-if (NOT GSTREAMER_FOUND OR NOT GSTREAMER_APP_FOUND)
-    message(WARNING "GStreamer and Gstreamer App are required to build this plugin.")
+if (NOT GSTREAMER_FOUND OR NOT GSTREAMER_APP_FOUND OR NOT OpenCV_FOUND)
+    message(WARNING "GStreamer, Gstreamer App and OpenCV are required to build this plugin.")
 else()
     add_library(${PROJECT_NAME} SHARED
         GstCameraSystem.cpp
@@ -53,6 +54,7 @@ else()
         PUBLIC ${GZ_TRANSPORT_TARGET}
         PUBLIC ${GSTREAMER_LIBRARIES}
         PUBLIC ${GSTREAMER_APP_LIBRARIES}
+        PUBLIC ${OpenCV_LIBS}
     )
 
     target_include_directories(${PROJECT_NAME}
@@ -61,6 +63,7 @@ else()
         PUBLIC px4_gz_msgs
         PUBLIC ${GSTREAMER_INCLUDE_DIRS}
         PUBLIC ${GSTREAMER_APP_INCLUDE_DIRS}
+        PUBLIC ${OpenCV_INCLUDE_DIRS}
     )
 
     target_compile_options(${PROJECT_NAME}

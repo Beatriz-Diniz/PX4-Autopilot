@@ -429,6 +429,15 @@ bool GZBridge::subscribeAttacks(bool required)
     // Topico separado para habilitar ou desabilitar a mitigacao GPS.
     std::string attack_mitigation_topic = "/gazebo/default/mitigation/control";
 
+    // Sinal publicado pelo GstCameraSystem (processo separado do Gazebo)
+    // quando a mitigacao de flip do stream confirma um ataque. O GZBridge
+    // so repassa o aviso para o terminal do PX4, ja que o plugin de camera
+    // nao tem acesso a PX4_WARN nem a esse console.
+    std::string stream_flip_detected_topic = "/gazebo/default/attack/stream_flip_detected";
+
+    // Mesmo mecanismo, para a mitigacao do quadrado preto do stream.
+    std::string stream_black_detected_topic = "/gazebo/default/attack/stream_black_detected";
+
     if (!_node.Subscribe(gps_attack_topic, &GZBridge::gpsAttackCallback, this)) {
         PX4_ERR("failed to subscribe to attack topic: %s", gps_attack_topic.c_str());
         return required ? false : true;
@@ -477,6 +486,14 @@ bool GZBridge::subscribeAttacks(bool required)
     if (!_node.Subscribe(attack_mitigation_topic, &GZBridge::attackMitigationCallback, this)) {
         PX4_ERR("failed to subscribe to mitigation topic: %s", attack_mitigation_topic.c_str());
         return required ? false : true;
+    }
+
+    if (!_node.Subscribe(stream_flip_detected_topic, &GZBridge::streamFlipDetectedCallback, this)) {
+        PX4_WARN("failed to subscribe to %s", stream_flip_detected_topic.c_str());
+    }
+
+    if (!_node.Subscribe(stream_black_detected_topic, &GZBridge::streamBlackDetectedCallback, this)) {
+        PX4_WARN("failed to subscribe to %s", stream_black_detected_topic.c_str());
     }
 
     return true;
@@ -528,6 +545,26 @@ void GZBridge::streamAttackCallback(const gz::msgs::Int32 &msg)
     _stream_cmd_pub.Publish(stream_cmd);
 }
 // ======== ATAQUE STREAM DE CAMERA - FIM ========
+
+// ======== MITIGACAO FLIP - INICIO ========
+// So repassa o aviso ja emitido pelo GstCameraSystem (processo do Gazebo,
+// sem acesso a este terminal) no formato usado pelas demais mitigacoes.
+// A deteccao em si roda inteiramente no plugin de camera, por continuidade
+// temporal do proprio video — este callback nao decide nada, so imprime.
+void GZBridge::streamFlipDetectedCallback(const gz::msgs::Int32 & /*msg*/)
+{
+    PX4_WARN("\n[Flip-Mitig] Attack detected: FLIP\n");
+}
+// ======== MITIGACAO FLIP - FIM ========
+
+// ======== MITIGACAO QUADRADO PRETO - INICIO ========
+// Mesmo mecanismo do flip: so repassa o aviso ja emitido pelo
+// GstCameraSystem, sem decidir nada aqui.
+void GZBridge::streamBlackDetectedCallback(const gz::msgs::Int32 & /*msg*/)
+{
+    PX4_WARN("\n[Black-Mitig] Attack detected: BLACK_SQUARE\n");
+}
+// ======== MITIGACAO QUADRADO PRETO - FIM ========
 
 // ======== ATAQUE MOTOR - INICIO ========
 // Ataque em motor: repassa opcao, indice do motor e velocidade para a interface de mistura dos ESCs.
