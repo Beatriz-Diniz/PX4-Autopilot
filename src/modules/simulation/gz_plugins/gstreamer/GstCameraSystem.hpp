@@ -53,6 +53,8 @@
 #include <gz/msgs/int32.pb.h>
 #include <gz/msgs/vector3d.pb.h>
 
+#include "StreamAttack.hpp"
+
 namespace custom
 {
 class GstCameraSystem :
@@ -117,8 +119,9 @@ private:
 	bool _initialized {};
 
 	// ataque stream
-	void onStreamCmd(const gz::msgs::Int32 &msg);
-	int _stream_attack_option{0};
+	// void onStreamCmd(const gz::msgs::Int32 &msg);
+	// int _stream_attack_option{0};
+	StreamAttack _streamAttack{_node};
 
 	// ======== MITIGACAO GERAL - INICIO ========
 	// Mesmo topico unico de liga/desliga que todas as mitigacoes do

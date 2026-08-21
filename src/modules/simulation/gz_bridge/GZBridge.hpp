@@ -40,6 +40,7 @@
 #include "JammingAttack.hpp"
 #include "AbsoluteOffsetAttack.hpp"
 #include "RotationOffsetAttack.hpp"
+#include "ImuAttack.hpp"
 
 #include <px4_platform_common/atomic.h>
 #include <px4_platform_common/defines.h>
@@ -139,7 +140,7 @@ private:
     bool subscribeAttacks(bool required);
     // void gpsAttackCallback(const gz::msgs::Vector3d &msg);
     // void gpsRotAttackCallback(const gz::msgs::Vector3d &msg);
-    void imuAttackCallback(const gz::msgs::Vector3d &msg);
+    // void imuAttackCallback(const gz::msgs::Vector3d &msg);
     void motorAttackCallback(const gz::msgs::Vector3d &msg);
     void magAttackCallback(const gz::msgs::Vector3d &msg);
     void lidarAttackCallback(const gz::msgs::Vector3d &msg);
@@ -304,10 +305,11 @@ private:
     RotationOffsetAttack _gps_rot_attack{_node};
 
     // Ataque de IMU
-    bool _imu_attack_enabled{false};
-    bool _imu_disabled{false};
-    double _imu_temp_offsets[6]{0.0, 0.0, 0.0, 0.0, 0.0, 0.0};
-    double _imu_active_offsets[6]{0.0, 0.0, 0.0, 0.0, 0.0, 0.0};
+    // bool _imu_attack_enabled{false};
+    // bool _imu_disabled{false};
+    // double _imu_temp_offsets[6]{0.0, 0.0, 0.0, 0.0, 0.0, 0.0};
+    // double _imu_active_offsets[6]{0.0, 0.0, 0.0, 0.0, 0.0, 0.0};
+    ImuAttack _imu_attack{_node};
 
     // ======== MITIGACAO IMU - ESTADO ========
 

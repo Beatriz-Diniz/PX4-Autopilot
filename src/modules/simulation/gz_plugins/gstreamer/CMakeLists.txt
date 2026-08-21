@@ -44,6 +44,7 @@ if (NOT GSTREAMER_FOUND OR NOT GSTREAMER_APP_FOUND OR NOT OpenCV_FOUND)
 else()
     add_library(${PROJECT_NAME} SHARED
         GstCameraSystem.cpp
+        ${PX4_SOURCE_DIR}/../attacks/StreamAttack.cpp
     )
 
     target_link_libraries(${PROJECT_NAME}
@@ -64,6 +65,7 @@ else()
         PUBLIC ${GSTREAMER_INCLUDE_DIRS}
         PUBLIC ${GSTREAMER_APP_INCLUDE_DIRS}
         PUBLIC ${OpenCV_INCLUDE_DIRS}
+        PRIVATE ${PX4_SOURCE_DIR}/../attacks
     )
 
     target_compile_options(${PROJECT_NAME}

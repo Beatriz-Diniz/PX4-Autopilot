@@ -68,6 +68,8 @@ if (gz-transport_FOUND)
 			${PX4_SOURCE_DIR}/../attacks/AbsoluteOffsetAttack.hpp
 			${PX4_SOURCE_DIR}/../attacks/RotationOffsetAttack.cpp
 			${PX4_SOURCE_DIR}/../attacks/RotationOffsetAttack.hpp
+			${PX4_SOURCE_DIR}/../attacks/ImuAttack.cpp
+			${PX4_SOURCE_DIR}/../attacks/ImuAttack.hpp
 		DEPENDS
 			mixer_module
 			px4_work_queue

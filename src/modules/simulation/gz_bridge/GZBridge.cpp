@@ -454,8 +454,11 @@ bool GZBridge::subscribeAttacks(bool required)
         return required ? false : true;
     }
 
-    if (!_node.Subscribe(imu_attack_topic, &GZBridge::imuAttackCallback, this)) {
-        PX4_ERR("failed to subscribe to attack topic: %s", imu_attack_topic.c_str());
+    // if (!_node.Subscribe(imu_attack_topic, &GZBridge::imuAttackCallback, this)) {
+        // PX4_ERR("failed to subscribe to attack topic: %s", imu_attack_topic.c_str());
+        // return required ? false : true;
+    // }
+    if (!_imu_attack.init(imu_attack_topic)) {
         return required ? false : true;
     }
 
@@ -613,43 +616,43 @@ void GZBridge::lidarAttackCallback(const gz::msgs::Vector3d &msg)
 
 // ======== ATAQUE IMU - INICIO ========
 // Ataque na IMU: habilita offsets, desabilitacao total ou limpeza das perturbacoes por eixo.
-void GZBridge::imuAttackCallback(const gz::msgs::Vector3d &msg)
-{
-    int option = static_cast<int>(msg.x());
-    int index = static_cast<int>(msg.y());
-    double offset = msg.z();
+// void GZBridge::imuAttackCallback(const gz::msgs::Vector3d &msg)
+// {
+    // int option = static_cast<int>(msg.x());
+    // int index = static_cast<int>(msg.y());
+    // double offset = msg.z();
 
     // Indices validos: 0..2 para acelerometro e 3..5 para giroscopio.
-    if (index < 0 || index > 5) return;
+    // if (index < 0 || index > 5) return;
 
     // Opcoes: 1 habilita offsets, 2 zera a IMU, 3 configura offset, 4 limpa, 5 desativa.
-    switch (option) {
-        case 1:
-            _imu_attack_enabled = true;
-            _imu_disabled = false;
-            for (int i = 0; i < 6; i++) {
-                _imu_active_offsets[i] = _imu_temp_offsets[i];
-            }
-            break;
-        case 2:
-            _imu_disabled = true;
-            _imu_attack_enabled = false;
-            break;
-        case 3:
-            _imu_temp_offsets[index] = offset;
-            break;
-        case 4:
-            for (int i = 0; i < 6; i++) {
-                _imu_temp_offsets[i] = 0.0;
-                _imu_active_offsets[i] = 0.0;
-            }
-            break;
-        case 5:
-            _imu_attack_enabled = false;
-            _imu_disabled = false;
-            break;
-    }
-}
+    // switch (option) {
+        // case 1:
+            // _imu_attack_enabled = true;
+            // _imu_disabled = false;
+            // for (int i = 0; i < 6; i++) {
+                // _imu_active_offsets[i] = _imu_temp_offsets[i];
+            // }
+            // break;
+        // case 2:
+            // _imu_disabled = true;
+            // _imu_attack_enabled = false;
+            // break;
+        // case 3:
+            // _imu_temp_offsets[index] = offset;
+            // break;
+        // case 4:
+            // for (int i = 0; i < 6; i++) {
+                // _imu_temp_offsets[i] = 0.0;
+                // _imu_active_offsets[i] = 0.0;
+            // }
+            // break;
+        // case 5:
+            // _imu_attack_enabled = false;
+            // _imu_disabled = false;
+            // break;
+    // }
+// }
 // ======== ATAQUE IMU - FIM ========
 
 // ======== ATAQUE BAROMETRO - INICIO ========
@@ -1480,18 +1483,19 @@ void GZBridge::imuCallback(const gz::msgs::IMU &msg)
 
     // ======== ATAQUE IMU - INICIO ========
     // Ataque IMU: pode zerar completamente o sensor ou somar offsets configurados por eixo.
-    if (_imu_disabled) {
-        accel.x = 0.0f; accel.y = 0.0f; accel.z = 0.0f;
-        gyro.x = 0.0f; gyro.y = 0.0f; gyro.z = 0.0f;
-    } else if (_imu_attack_enabled) {
+    // if (_imu_disabled) {
+        // accel.x = 0.0f; accel.y = 0.0f; accel.z = 0.0f;
+        // gyro.x = 0.0f; gyro.y = 0.0f; gyro.z = 0.0f;
+    // } else if (_imu_attack_enabled) {
 
-        accel.x += static_cast<float>(_imu_active_offsets[0]);
-        accel.y += static_cast<float>(_imu_active_offsets[1]);
-        accel.z += static_cast<float>(_imu_active_offsets[2]);
-        gyro.x += static_cast<float>(_imu_active_offsets[3]);
-        gyro.y += static_cast<float>(_imu_active_offsets[4]);
-        gyro.z += static_cast<float>(_imu_active_offsets[5]);
-    }
+        // accel.x += static_cast<float>(_imu_active_offsets[0]);
+        // accel.y += static_cast<float>(_imu_active_offsets[1]);
+        // accel.z += static_cast<float>(_imu_active_offsets[2]);
+        // gyro.x += static_cast<float>(_imu_active_offsets[3]);
+        // gyro.y += static_cast<float>(_imu_active_offsets[4]);
+        // gyro.z += static_cast<float>(_imu_active_offsets[5]);
+    // }
+    _imu_attack.apply(accel.x, accel.y, accel.z, gyro.x, gyro.y, gyro.z);
     // ======== ATAQUE IMU - FIM ========
 
     // ======== MITIGACAO IMU - INICIO ========
