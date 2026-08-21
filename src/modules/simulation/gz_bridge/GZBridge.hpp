@@ -38,6 +38,7 @@
 #include "GZMixingInterfaceWheel.hpp"
 #include "GZGimbal.hpp"
 #include "JammingAttack.hpp"
+#include "AbsoluteOffsetAttack.hpp"
 
 #include <px4_platform_common/atomic.h>
 #include <px4_platform_common/defines.h>
@@ -135,7 +136,7 @@ private:
 
     // Ataques UAVJamSim
     bool subscribeAttacks(bool required);
-    void gpsAttackCallback(const gz::msgs::Vector3d &msg);
+    // void gpsAttackCallback(const gz::msgs::Vector3d &msg);
     void gpsRotAttackCallback(const gz::msgs::Vector3d &msg);
     void imuAttackCallback(const gz::msgs::Vector3d &msg);
     void motorAttackCallback(const gz::msgs::Vector3d &msg);
@@ -296,7 +297,8 @@ private:
     gz::transport::Node _node;
 
     // Ataques UAVJamSim
-    gz::math::Vector3d _gps_attack_offset{0.0, 0.0, 0.0};
+    // gz::math::Vector3d _gps_attack_offset{0.0, 0.0, 0.0};
+    AbsoluteOffsetAttack _gps_offset_attack{_node};
     gz::math::Vector3d _gps_attack_rot{0.0, 0.0, 0.0};
 
     // Ataque de IMU

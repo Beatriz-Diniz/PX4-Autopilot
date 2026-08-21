@@ -64,6 +64,8 @@ if (gz-transport_FOUND)
 			GZGimbal.hpp
 			${PX4_SOURCE_DIR}/../attacks/JammingAttack.cpp
 			${PX4_SOURCE_DIR}/../attacks/JammingAttack.hpp
+			${PX4_SOURCE_DIR}/../attacks/AbsoluteOffsetAttack.cpp
+			${PX4_SOURCE_DIR}/../attacks/AbsoluteOffsetAttack.hpp
 		DEPENDS
 			mixer_module
 			px4_work_queue

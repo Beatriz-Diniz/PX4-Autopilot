@@ -438,8 +438,11 @@ bool GZBridge::subscribeAttacks(bool required)
     // Mesmo mecanismo, para a mitigacao do quadrado preto do stream.
     std::string stream_black_detected_topic = "/gazebo/default/attack/stream_black_detected";
 
-    if (!_node.Subscribe(gps_attack_topic, &GZBridge::gpsAttackCallback, this)) {
-        PX4_ERR("failed to subscribe to attack topic: %s", gps_attack_topic.c_str());
+    // if (!_node.Subscribe(gps_attack_topic, &GZBridge::gpsAttackCallback, this)) {
+        // PX4_ERR("failed to subscribe to attack topic: %s", gps_attack_topic.c_str());
+        // return required ? false : true;
+    // }
+    if (!_gps_offset_attack.init(gps_attack_topic)) {
         return required ? false : true;
     }
 
@@ -505,12 +508,12 @@ bool GZBridge::subscribeAttacks(bool required)
 
 // ======== ATAQUE GPS OFFSET - INICIO ========
 // Ataque GPS por offset: atualiza deslocamentos artificiais de latitude, longitude e altitude.
-void GZBridge::gpsAttackCallback(const gz::msgs::Vector3d &msg)
-{
+// void GZBridge::gpsAttackCallback(const gz::msgs::Vector3d &msg)
+// {
 
     // msg.x/y/z representam offsets aplicados diretamente a latitude, longitude e altitude.
-    _gps_attack_offset.Set(msg.x(), msg.y(), msg.z());
-}
+    // _gps_attack_offset.Set(msg.x(), msg.y(), msg.z());
+// }
 // ======== ATAQUE GPS OFFSET - FIM ========
 
 // ======== ATAQUE GPS ROTACAO - INICIO ========
@@ -3671,8 +3674,10 @@ void GZBridge::navSatCallback(const gz::msgs::NavSat &msg)
 
     // ======== ATAQUE GPS OFFSET E ROTACAO - INICIO ========
     // Ataques GPS por offset e rotacao sao aplicados antes do ruido nominal.
-    double lat_offset = _gps_attack_offset.X();
-    double lon_offset = _gps_attack_offset.Y();
+    // double lat_offset = _gps_attack_offset.X();
+    // double lon_offset = _gps_attack_offset.Y();
+    double lat_offset = _gps_offset_attack.offsetLatDeg();
+    double lon_offset = _gps_offset_attack.offsetLonDeg();
 
     if (fabs(_gps_attack_rot.X()) > 1e-6 || fabs(_gps_attack_rot.Y()) > 1e-6) {
         double angle_rad = math::radians(_gps_attack_rot.Y());
@@ -3683,7 +3688,8 @@ void GZBridge::navSatCallback(const gz::msgs::NavSat &msg)
 
     double latitude = msg.latitude_deg() + lat_offset;
     double longitude = msg.longitude_deg() + lon_offset;
-    double altitude = msg.altitude() + _gps_attack_offset.Z() + _gps_attack_rot.Z();
+    // double altitude = msg.altitude() + _gps_attack_offset.Z() + _gps_attack_rot.Z();
+    double altitude = msg.altitude() + _gps_offset_attack.offsetAltM() + _gps_attack_rot.Z();
     // ======== ATAQUE GPS OFFSET E ROTACAO - FIM ========
 
     float vel_north = msg.velocity_north();
