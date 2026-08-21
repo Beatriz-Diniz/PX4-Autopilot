@@ -478,8 +478,11 @@ bool GZBridge::subscribeAttacks(bool required)
         return required ? false : true;
     }
 
-    if (!_node.Subscribe(jamming_attack_topic, &GZBridge::jammingAttackCallback, this)) {
-        PX4_ERR("failed to subscribe to attack topic: %s", jamming_attack_topic.c_str());
+    // if (!_node.Subscribe(jamming_attack_topic, &GZBridge::jammingAttackCallback, this)) {
+        // PX4_ERR("failed to subscribe to attack topic: %s", jamming_attack_topic.c_str());
+        // return required ? false : true;
+    // }
+    if (!_jamming_attack.init(jamming_attack_topic)) {
         return required ? false : true;
     }
 
@@ -658,67 +661,67 @@ void GZBridge::baroAttackCallback(const gz::msgs::Vector3d &msg)
 
 // ======== ATAQUE GPS JAMMING - INICIO ========
 // Ataque de jamming GPS: seleciona ruido continuo, blackout ou jamming pulsado.
-void GZBridge::jammingAttackCallback(const gz::msgs::Vector3d &msg)
-{
+// void GZBridge::jammingAttackCallback(const gz::msgs::Vector3d &msg)
+// {
     // msg.x seleciona o tipo de jamming e msg.y define a intensidade.
-    _jamming_attack_type = static_cast<int>(msg.x());
-    _jamming_intensity   = static_cast<float>(msg.y());
+    // _jamming_attack_type = static_cast<int>(msg.x());
+    // _jamming_intensity   = static_cast<float>(msg.y());
 
     // ======== ATAQUE GPS JAMMING DESATIVADO - INICIO ========
     // Tipo 0: desativa o jamming e reinicia a maquina de estados pulsada.
-    if (_jamming_attack_type == 0) {
+    // if (_jamming_attack_type == 0) {
 
-        _pjam_state                = PulsedJamState::IDLE;
-        _pjam_state_enter_us       = 0;
-        _jamming_pulsed_initialized = false;
-        _jamming_intermittent_active = false;
-        _pjam_noise_factor         = 0.0f;
-        PX4_INFO("[Jamming] DISABLED");
+        // _pjam_state                = PulsedJamState::IDLE;
+        // _pjam_state_enter_us       = 0;
+        // _jamming_pulsed_initialized = false;
+        // _jamming_intermittent_active = false;
+        // _pjam_noise_factor         = 0.0f;
+        // PX4_INFO("[Jamming] DISABLED");
     // ======== ATAQUE GPS JAMMING DESATIVADO - FIM ========
 
     // ======== ATAQUE 1 GPS NOISE JAMMING - INICIO ========
     // Tipo 1: jamming por ruido continuo aplicado a posicao, altitude e velocidade GPS.
-    } else if (_jamming_attack_type == 1) {
-        PX4_WARN("[Jamming] NOISE: ENABLED, Intensity=%.2f",
-                 static_cast<double>(_jamming_intensity));
+    // } else if (_jamming_attack_type == 1) {
+        // PX4_WARN("[Jamming] NOISE: ENABLED, Intensity=%.2f",
+                 // static_cast<double>(_jamming_intensity));
     // ======== ATAQUE 1 GPS NOISE JAMMING - FIM ========
 
     // ======== ATAQUE 2 GPS BLACKOUT - INICIO ========
     // Tipo 2: blackout, simulando perda total de atualizacao GPS.
-    } else if (_jamming_attack_type == 2) {
-        PX4_WARN("[Jamming] BLACKOUT: ENABLED (Signal Drop)");
+    // } else if (_jamming_attack_type == 2) {
+        // PX4_WARN("[Jamming] BLACKOUT: ENABLED (Signal Drop)");
     // ======== ATAQUE 2 GPS BLACKOUT - FIM ========
 
     // ======== ATAQUE 3 GPS PULSED JAMMING - INICIO ========
     // Tipo 3: jamming pulsado com subida, bloqueio, decaimento e recuperacao.
-    } else if (_jamming_attack_type == 3) {
+    // } else if (_jamming_attack_type == 3) {
 
         // A intensidade controla a duracao do bloqueio total dentro do ciclo pulsado.
-        float clamped = math::constrain(_jamming_intensity, 0.1f, 1.0f);
+        // float clamped = math::constrain(_jamming_intensity, 0.1f, 1.0f);
 
-        _pjam_ramp_us  = 500000ULL;
-        _pjam_on_us    = static_cast<uint64_t>(clamped * 10.0f * 1e6f);
-        _pjam_decay_us = 800000ULL;
-        _pjam_off_us   = 2000000ULL;
+        // _pjam_ramp_us  = 500000ULL;
+        // _pjam_on_us    = static_cast<uint64_t>(clamped * 10.0f * 1e6f);
+        // _pjam_decay_us = 800000ULL;
+        // _pjam_off_us   = 2000000ULL;
 
-        if (!_jamming_pulsed_initialized) {
-            _pjam_state              = PulsedJamState::RAMP_UP;
-            _pjam_state_enter_us     = hrt_absolute_time();
-            _jamming_pulsed_initialized = true;
-            _jamming_intermittent_active = false;
-            _pjam_noise_factor       = 0.0f;
-        }
+        // if (!_jamming_pulsed_initialized) {
+            // _pjam_state              = PulsedJamState::RAMP_UP;
+            // _pjam_state_enter_us     = hrt_absolute_time();
+            // _jamming_pulsed_initialized = true;
+            // _jamming_intermittent_active = false;
+            // _pjam_noise_factor       = 0.0f;
+        // }
 
-        PX4_WARN("[Jamming] PULSED ENABLED | Intensity=%.2f"
-                 " | ramp=%llums on=%llums decay=%llums off=%llums",
-                 static_cast<double>(clamped),
-                 (unsigned long long)(_pjam_ramp_us  / 1000),
-                 (unsigned long long)(_pjam_on_us    / 1000),
-                 (unsigned long long)(_pjam_decay_us / 1000),
-                 (unsigned long long)(_pjam_off_us   / 1000));
-    }
+        // PX4_WARN("[Jamming] PULSED ENABLED | Intensity=%.2f"
+                 // " | ramp=%llums on=%llums decay=%llums off=%llums",
+                 // static_cast<double>(clamped),
+                 // (unsigned long long)(_pjam_ramp_us  / 1000),
+                 // (unsigned long long)(_pjam_on_us    / 1000),
+                 // (unsigned long long)(_pjam_decay_us / 1000),
+                 // (unsigned long long)(_pjam_off_us   / 1000));
+    // }
     // ======== ATAQUE 3 GPS PULSED JAMMING - FIM ========
-}
+// }
 // ======== ATAQUE GPS JAMMING - FIM ========
 
 // ======== MITIGACAO GPS - INICIO ========
@@ -3641,7 +3644,8 @@ void GZBridge::navSatCallback(const gz::msgs::NavSat &msg)
     // Ataque 2: blackout GPS. O ataque apenas bloqueia a publicacao do GPS real.
     // A mitigacao detecta a falha por timeout
     // da ultima publicacao GPS real no imuCallback().
-    if (_jamming_attack_type == 2) {
+    // if (_jamming_attack_type == 2) {
+    if (_jamming_attack.isBlackoutActive()) {
 
         // Garante que a origem de projecao local exista para permitir reprojecao do pseudo-GPS.
         if (!_pos_ref.isInitialized()) {
@@ -3700,24 +3704,25 @@ void GZBridge::navSatCallback(const gz::msgs::NavSat &msg)
 
     // ======== ATAQUE 1 GPS NOISE JAMMING - INICIO ========
     // Ataque 1: jamming por ruido continuo. A perturbacao afeta posicao, altitude e velocidade.
-    if (_jamming_attack_type == 1) {
+    // if (_jamming_attack_type == 1) {
 
         // Ruido horizontal em metros convertido para latitude/longitude.
-        const double lat_rad = math::radians(latitude);
-        const double noise_n_m = static_cast<double>(generate_wgn() * _jamming_intensity * 10.0f);
-        const double noise_e_m = static_cast<double>(generate_wgn() * _jamming_intensity * 10.0f);
+        // const double lat_rad = math::radians(latitude);
+        // const double noise_n_m = static_cast<double>(generate_wgn() * _jamming_intensity * 10.0f);
+        // const double noise_e_m = static_cast<double>(generate_wgn() * _jamming_intensity * 10.0f);
 
-        latitude  += math::degrees(noise_n_m / CONSTANTS_RADIUS_OF_EARTH);
-        longitude += math::degrees(noise_e_m / (CONSTANTS_RADIUS_OF_EARTH * cos(lat_rad)));
+        // latitude  += math::degrees(noise_n_m / CONSTANTS_RADIUS_OF_EARTH);
+        // longitude += math::degrees(noise_e_m / (CONSTANTS_RADIUS_OF_EARTH * cos(lat_rad)));
 
         // O canal vertical recebe ruido maior para representar a menor precisao vertical do GPS.
-        altitude += static_cast<double>(generate_wgn() * _jamming_intensity * 30.0f);
+        // altitude += static_cast<double>(generate_wgn() * _jamming_intensity * 30.0f);
 
         // Velocidades tambem sao perturbadas para simular uma medicao GPS dinamicamente inconsistente.
-        vel_north += generate_wgn() * _jamming_intensity * 10.0f;
-        vel_east += generate_wgn() * _jamming_intensity * 10.0f;
-        vel_down += generate_wgn() * _jamming_intensity * 10.0f;
-    }
+        // vel_north += generate_wgn() * _jamming_intensity * 10.0f;
+        // vel_east += generate_wgn() * _jamming_intensity * 10.0f;
+        // vel_down += generate_wgn() * _jamming_intensity * 10.0f;
+    // }
+    _jamming_attack.applyNoiseJamming(latitude, longitude, altitude, vel_north, vel_east, vel_down);
     // ======== ATAQUE 1 GPS NOISE JAMMING - FIM ========
 
     // ======== MITIGACAO GPS - INICIO ========
@@ -4125,101 +4130,110 @@ void GZBridge::navSatCallback(const gz::msgs::NavSat &msg)
 
     // ======== ATAQUE 3 GPS PULSED JAMMING - INICIO ========
     // Ataque 3: maquina de estados do jamming pulsado.
-    if (_jamming_attack_type == 3 && _jamming_pulsed_initialized) {
-        const uint64_t now     = hrt_absolute_time();
-        const uint64_t elapsed = now - _pjam_state_enter_us;
+    // if (_jamming_attack_type == 3 && _jamming_pulsed_initialized) {
+        // const uint64_t now     = hrt_absolute_time();
+        // const uint64_t elapsed = now - _pjam_state_enter_us;
 
         // Estados: subida do jammer, bloqueio total, decaimento e periodo valido.
-        switch (_pjam_state) {
+        // switch (_pjam_state) {
 
-        case PulsedJamState::RAMP_UP: {
+        // case PulsedJamState::RAMP_UP: {
             // RAMP_UP: o sinal piora gradualmente e o ruido cresce de 0 ate 100%.
 
-            _pjam_noise_factor = math::constrain(
-                static_cast<float>(elapsed) / static_cast<float>(_pjam_ramp_us),
-                0.0f, 1.0f);
-            _jamming_intermittent_active = true;
+            // _pjam_noise_factor = math::constrain(
+                // static_cast<float>(elapsed) / static_cast<float>(_pjam_ramp_us),
+                // 0.0f, 1.0f);
+            // _jamming_intermittent_active = true;
 
-            if (elapsed >= _pjam_ramp_us) {
-                _pjam_state          = PulsedJamState::JAM;
-                _pjam_state_enter_us = now;
-                _pjam_noise_factor   = 1.0f;
-                PX4_WARN("[UAVJamSim Jamming] >>> JAM ON <<< (%.1f s)",
-                         static_cast<double>(_pjam_on_us) / 1e6);
-            }
+            // if (elapsed >= _pjam_ramp_us) {
+                // _pjam_state          = PulsedJamState::JAM;
+                // _pjam_state_enter_us = now;
+                // _pjam_noise_factor   = 1.0f;
+                // PX4_WARN("[UAVJamSim Jamming] >>> JAM ON <<< (%.1f s)",
+                         // static_cast<double>(_pjam_on_us) / 1e6);
+            // }
 
-            break;
-        }
+            // break;
+        // }
 
-        case PulsedJamState::JAM: {
+        // case PulsedJamState::JAM: {
             // JAM: bloqueio total; nenhuma mensagem GPS e publicada enquanto o pulso esta ativo.
             // Durante o pouso ja iniciado, mantem a pseudo-medicao de pouso sendo publicada.
-            _pjam_noise_factor           = 1.0f;
-            _jamming_intermittent_active = true;
+            // _pjam_noise_factor           = 1.0f;
+            // _jamming_intermittent_active = true;
 
-            if (elapsed >= _pjam_on_us) {
-                _pjam_state          = PulsedJamState::DECAY;
-                _pjam_state_enter_us = now;
-                PX4_INFO("[UAVJamSim Jamming] <<< JAM OFF — DECAY >>>");
-            } else {
-                if (!_gps_landing_active) {
-                    return;
-                }
-            }
-            break;
-        }
+            // if (elapsed >= _pjam_on_us) {
+                // _pjam_state          = PulsedJamState::DECAY;
+                // _pjam_state_enter_us = now;
+                // PX4_INFO("[UAVJamSim Jamming] <<< JAM OFF — DECAY >>>");
+            // } else {
+                // if (!_gps_landing_active) {
+                    // return;
+                // }
+            // }
+            // break;
+        // }
 
-        case PulsedJamState::DECAY: {
+        // case PulsedJamState::DECAY: {
             // DECAY: o jammer deixa de bloquear e o ruido reduz gradualmente.
 
-            _pjam_noise_factor = math::constrain(
-                1.0f - static_cast<float>(elapsed) / static_cast<float>(_pjam_decay_us),
-                0.0f, 1.0f);
-            _jamming_intermittent_active = (_pjam_noise_factor > 0.05f);
+            // _pjam_noise_factor = math::constrain(
+                // 1.0f - static_cast<float>(elapsed) / static_cast<float>(_pjam_decay_us),
+                // 0.0f, 1.0f);
+            // _jamming_intermittent_active = (_pjam_noise_factor > 0.05f);
 
-            if (elapsed >= _pjam_decay_us) {
-                _pjam_state          = PulsedJamState::VALID;
-                _pjam_state_enter_us = now;
-                _pjam_noise_factor   = 0.0f;
-                _jamming_intermittent_active = false;
-                PX4_INFO("[UAVJamSim Jamming] <<< GPS VALID — recovery >>>");
-            }
-            break;
-        }
+            // if (elapsed >= _pjam_decay_us) {
+                // _pjam_state          = PulsedJamState::VALID;
+                // _pjam_state_enter_us = now;
+                // _pjam_noise_factor   = 0.0f;
+                // _jamming_intermittent_active = false;
+                // PX4_INFO("[UAVJamSim Jamming] <<< GPS VALID — recovery >>>");
+            // }
+            // break;
+        // }
 
-        case PulsedJamState::VALID: {
+        // case PulsedJamState::VALID: {
             // VALID: janela com GPS limpo antes do proximo pulso.
-            _pjam_noise_factor           = 0.0f;
-            _jamming_intermittent_active = false;
+            // _pjam_noise_factor           = 0.0f;
+            // _jamming_intermittent_active = false;
 
-            if (elapsed >= _pjam_off_us) {
+            // if (elapsed >= _pjam_off_us) {
 
-                _pjam_state          = PulsedJamState::RAMP_UP;
-                _pjam_state_enter_us = now;
-                PX4_WARN("[UAVJamSim Jamming] >>> NEW PULSE — RAMP_UP >>>");
-            }
-            break;
-        }
+                // _pjam_state          = PulsedJamState::RAMP_UP;
+                // _pjam_state_enter_us = now;
+                // PX4_WARN("[UAVJamSim Jamming] >>> NEW PULSE — RAMP_UP >>>");
+            // }
+            // break;
+        // }
 
-        default:
-            break;
-        }
+        // default:
+            // break;
+        // }
 
         // Em RAMP_UP/DECAY, injeta ruido proporcional a potencia instantanea do pulso.
         // Durante o pouso, mantem a pseudo-medicao sem ruido pulsado adicional.
-        if (_pjam_noise_factor > 0.0f) {
-            const float noise_factor = _pjam_noise_factor;
-            const double lat_rad = math::radians(latitude);
-            const double noise_n_m = static_cast<double>(generate_wgn() * noise_factor * _jamming_intensity * 1000.0f);
-            const double noise_e_m = static_cast<double>(generate_wgn() * noise_factor * _jamming_intensity * 1000.0f);
+        // if (_pjam_noise_factor > 0.0f) {
+            // const float noise_factor = _pjam_noise_factor;
+            // const double lat_rad = math::radians(latitude);
+            // const double noise_n_m = static_cast<double>(generate_wgn() * noise_factor * _jamming_intensity * 1000.0f);
+            // const double noise_e_m = static_cast<double>(generate_wgn() * noise_factor * _jamming_intensity * 1000.0f);
 
-            latitude  += math::degrees(noise_n_m / CONSTANTS_RADIUS_OF_EARTH);
-            longitude += math::degrees(noise_e_m / (CONSTANTS_RADIUS_OF_EARTH * cos(lat_rad)));
-            altitude  += static_cast<double>(generate_wgn() * noise_factor * _jamming_intensity * 80.0f);
-            vel_north += generate_wgn() * noise_factor * _jamming_intensity * 15.0f;
-            vel_east  += generate_wgn() * noise_factor * _jamming_intensity * 15.0f;
-            vel_down  += generate_wgn() * noise_factor * _jamming_intensity * 15.0f;
-        }
+            // latitude  += math::degrees(noise_n_m / CONSTANTS_RADIUS_OF_EARTH);
+            // longitude += math::degrees(noise_e_m / (CONSTANTS_RADIUS_OF_EARTH * cos(lat_rad)));
+            // altitude  += static_cast<double>(generate_wgn() * noise_factor * _jamming_intensity * 80.0f);
+            // vel_north += generate_wgn() * noise_factor * _jamming_intensity * 15.0f;
+            // vel_east  += generate_wgn() * noise_factor * _jamming_intensity * 15.0f;
+            // vel_down  += generate_wgn() * noise_factor * _jamming_intensity * 15.0f;
+        // }
+    // }
+    _jamming_attack.tickPulsedJamming(hrt_absolute_time(), latitude, longitude, altitude,
+                       vel_north, vel_east, vel_down);
+
+    // Reproduz o "return" original do estado JAM (bloqueio total do sinal
+    // enquanto o pulso esta ativo), exceto durante pouso automatico ja em
+    // andamento - mesma condicao que existia dentro do switch original.
+    if (_jamming_attack.isPulsedFullyJammed() && !_gps_landing_active) {
+        return;
     }
     // ======== ATAQUE 3 GPS PULSED JAMMING - FIM ========
 
@@ -4250,33 +4264,39 @@ void GZBridge::navSatCallback(const gz::msgs::NavSat &msg)
 
     // ======== ATAQUE 3 GPS PULSED JAMMING - INICIO ========
     // No jamming pulsado, degrada eph/epv/HDOP/VDOP e reduz satelites durante RAMP_UP/DECAY.
-    if (_pjam_noise_factor > 0.0f) {
-        const float noise_factor = _pjam_noise_factor;
+    // if (_pjam_noise_factor > 0.0f) {
+        // const float noise_factor = _pjam_noise_factor;
 
-        sensor_gps.eph  = sensor_gps.eph  + noise_factor * (15.0f  - sensor_gps.eph);
-        sensor_gps.epv  = sensor_gps.epv  + noise_factor * (25.0f  - sensor_gps.epv);
-        sensor_gps.hdop = sensor_gps.hdop + noise_factor * (8.0f   - sensor_gps.hdop);
-        sensor_gps.vdop = sensor_gps.vdop + noise_factor * (12.0f  - sensor_gps.vdop);
+        // sensor_gps.eph  = sensor_gps.eph  + noise_factor * (15.0f  - sensor_gps.eph);
+        // sensor_gps.epv  = sensor_gps.epv  + noise_factor * (25.0f  - sensor_gps.epv);
+        // sensor_gps.hdop = sensor_gps.hdop + noise_factor * (8.0f   - sensor_gps.hdop);
+        // sensor_gps.vdop = sensor_gps.vdop + noise_factor * (12.0f  - sensor_gps.vdop);
 
-        int base_satellites = _sim_gps_used.get();
-        sensor_gps.satellites_used = static_cast<uint8_t>(
-            math::constrain(static_cast<int>(base_satellites - static_cast<int>(noise_factor * (base_satellites - 3))),
-                            3, base_satellites));
-    } else {
-        sensor_gps.satellites_used = _sim_gps_used.get();
-    }
+        // int base_satellites = _sim_gps_used.get();
+        // sensor_gps.satellites_used = static_cast<uint8_t>(
+            // math::constrain(static_cast<int>(base_satellites - static_cast<int>(noise_factor * (base_satellites - 3))),
+                            // 3, base_satellites));
+    // } else {
+        // sensor_gps.satellites_used = _sim_gps_used.get();
+    // }
     // ======== ATAQUE 3 GPS PULSED JAMMING - FIM ========
 
     // ======== QUALIDADE GPS DURANTE NOISE JAMMING - INICIO ========
     // O GPS ruidoso continua valido, mas com incerteza maior para evitar
     // que o estimador trate saltos grandes como medicoes precisas.
-    if (_jamming_attack_type == 1) {
-        sensor_gps.eph  = math::max(sensor_gps.eph, 8.0f);
-        sensor_gps.epv  = math::max(sensor_gps.epv, 12.0f);
-        sensor_gps.hdop = math::max(sensor_gps.hdop, 2.5f);
-        sensor_gps.vdop = math::max(sensor_gps.vdop, 3.5f);
-    }
+    // if (_jamming_attack_type == 1) {
+        // sensor_gps.eph  = math::max(sensor_gps.eph, 8.0f);
+        // sensor_gps.epv  = math::max(sensor_gps.epv, 12.0f);
+        // sensor_gps.hdop = math::max(sensor_gps.hdop, 2.5f);
+        // sensor_gps.vdop = math::max(sensor_gps.vdop, 3.5f);
+    // }
     // ======== QUALIDADE GPS DURANTE NOISE JAMMING - FIM ========
+
+    // Encanamento: os dois blocos comentados acima ja estao implementados,
+    // idênticos, dentro de JammingAttack::degradeGpsQuality (inclui o
+    // fallback nominal de satellites_used quando nenhum ataque esta ativo).
+    _jamming_attack.degradeGpsQuality(sensor_gps, _sim_gps_used.get());
+
 
     sensor_gps.timestamp = timestamp;
     sensor_gps.timestamp_sample = timestamp;
@@ -4349,7 +4369,8 @@ void GZBridge::navSatCallback(const gz::msgs::NavSat &msg)
     // checagem, o valor contaminado passaria como "limpo" para quem usa
     // este cache como referencia independente (mitigacao de barometro,
     // entre outras).
-    if (!is_anchor_now && !_jamming_intermittent_active) {
+    // if (!is_anchor_now && !_jamming_intermittent_active) {
+    if (!is_anchor_now && !_jamming_attack.isPulsedIntermittentActive()) {
         float gps_n_m = 0.0f;
         float gps_e_m = 0.0f;
         _pos_ref.project(latitude, longitude, gps_n_m, gps_e_m);

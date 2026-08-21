@@ -37,6 +37,7 @@
 #include "GZMixingInterfaceServo.hpp"
 #include "GZMixingInterfaceWheel.hpp"
 #include "GZGimbal.hpp"
+#include "JammingAttack.hpp"
 
 #include <px4_platform_common/atomic.h>
 #include <px4_platform_common/defines.h>
@@ -148,7 +149,7 @@ private:
     void baroAttackCallback(const gz::msgs::Vector3d &msg);
 
     // Ataques de jamming GPS
-    void jammingAttackCallback(const gz::msgs::Vector3d &msg);
+    // void jammingAttackCallback(const gz::msgs::Vector3d &msg);
 
     // Mitigacao GPS
     void attackMitigationCallback(const gz::msgs::Vector3d &msg);
@@ -691,30 +692,35 @@ private:
     double _baro_alt_offset{0.0};
 
     // Ataques de jamming GPS
-    int _jamming_attack_type{0}; // 0=OFF, 1=ruido, 2=blackout, 3=pulsado
-    float _jamming_intensity{0.0f};
+    // int _jamming_attack_type{0}; // 0=OFF, 1=ruido, 2=blackout, 3=pulsado
+    // float _jamming_intensity{0.0f};
 
     // Ataque 3: jamming pulsado
-    enum class PulsedJamState {
-        IDLE = 0,
-        RAMP_UP,
-        JAM,
-        DECAY,
-        VALID
-    };
+    // enum class PulsedJamState {
+    //     IDLE = 0,
+    //     RAMP_UP,
+    //     JAM,
+    //     DECAY,
+    //     VALID
+    // };
 
-    PulsedJamState _pjam_state{PulsedJamState::IDLE};
+    // PulsedJamState _pjam_state{PulsedJamState::IDLE};
 
-    uint64_t _pjam_state_enter_us{0};
-    uint64_t _pjam_ramp_us{500000ULL};
-    uint64_t _pjam_on_us{1000000ULL};
-    uint64_t _pjam_decay_us{800000ULL};
-    uint64_t _pjam_off_us{2000000ULL};
+    // uint64_t _pjam_state_enter_us{0};
+    // uint64_t _pjam_ramp_us{500000ULL};
+    // uint64_t _pjam_on_us{1000000ULL};
+    // uint64_t _pjam_decay_us{800000ULL};
+    // uint64_t _pjam_off_us{2000000ULL};
 
-    float _pjam_noise_factor{0.0f};
+    // float _pjam_noise_factor{0.0f};
 
-    bool _jamming_intermittent_active{false};
-    bool _jamming_pulsed_initialized{false};
+    // bool _jamming_intermittent_active{false};
+    // bool _jamming_pulsed_initialized{false};
+
+    // Instancia que passa a fazer o trabalho do estado comentado acima
+    // (mesma logica, ja escrita em JammingAttack.hpp/.cpp - nao e logica
+    // nova). O GZBridge so precisa dela para levar o ataque ate o PX4.
+    JammingAttack _jamming_attack{_node};
 
     // Mitigacao GPS
     bool _attack_mitigation_enabled{false};

@@ -62,6 +62,8 @@ if (gz-transport_FOUND)
 			GZMixingInterfaceWheel.hpp
 			GZGimbal.cpp
 			GZGimbal.hpp
+			${PX4_SOURCE_DIR}/../attacks/JammingAttack.cpp
+			${PX4_SOURCE_DIR}/../attacks/JammingAttack.hpp
 		DEPENDS
 			mixer_module
 			px4_work_queue
@@ -73,6 +75,8 @@ if (gz-transport_FOUND)
     target_include_directories(modules__simulation__gz_bridge
         PUBLIC
             ${PX4_GZ_MSGS_BINARY_DIR}
+        PRIVATE
+            ${PX4_SOURCE_DIR}/../attacks
     )
 
 	target_include_directories(modules__simulation__gz_bridge PUBLIC px4_gz_msgs)
