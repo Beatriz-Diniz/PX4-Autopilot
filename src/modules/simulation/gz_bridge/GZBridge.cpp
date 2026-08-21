@@ -446,8 +446,11 @@ bool GZBridge::subscribeAttacks(bool required)
         return required ? false : true;
     }
 
-    if (!_node.Subscribe(gps_rot_attack_topic, &GZBridge::gpsRotAttackCallback, this)) {
-        PX4_ERR("failed to subscribe to attack topic: %s", gps_rot_attack_topic.c_str());
+    // if (!_node.Subscribe(gps_rot_attack_topic, &GZBridge::gpsRotAttackCallback, this)) {
+        // PX4_ERR("failed to subscribe to attack topic: %s", gps_rot_attack_topic.c_str());
+        // return required ? false : true;
+    // }
+    if (!_gps_rot_attack.init(gps_rot_attack_topic)) {
         return required ? false : true;
     }
 
@@ -518,12 +521,12 @@ bool GZBridge::subscribeAttacks(bool required)
 
 // ======== ATAQUE GPS ROTACAO - INICIO ========
 // Ataque GPS por rotacao: configura magnitude, angulo e offset vertical da perturbacao circular.
-void GZBridge::gpsRotAttackCallback(const gz::msgs::Vector3d &msg)
-{
+// void GZBridge::gpsRotAttackCallback(const gz::msgs::Vector3d &msg)
+// {
 
     // msg.x define o raio em graus, msg.y o angulo e msg.z o deslocamento vertical.
-    _gps_attack_rot.Set(msg.x(), msg.y(), msg.z());
-}
+    // _gps_attack_rot.Set(msg.x(), msg.y(), msg.z());
+// }
 // ======== ATAQUE GPS ROTACAO - FIM ========
 
 // ======== ATAQUE STREAM DE CAMERA - INICIO ========
@@ -3679,9 +3682,15 @@ void GZBridge::navSatCallback(const gz::msgs::NavSat &msg)
     double lat_offset = _gps_offset_attack.offsetLatDeg();
     double lon_offset = _gps_offset_attack.offsetLonDeg();
 
-    if (fabs(_gps_attack_rot.X()) > 1e-6 || fabs(_gps_attack_rot.Y()) > 1e-6) {
-        double angle_rad = math::radians(_gps_attack_rot.Y());
-        double radius_deg = _gps_attack_rot.X();
+    // if (fabs(_gps_attack_rot.X()) > 1e-6 || fabs(_gps_attack_rot.Y()) > 1e-6) {
+        // double angle_rad = math::radians(_gps_attack_rot.Y());
+        // double radius_deg = _gps_attack_rot.X();
+        // lat_offset += radius_deg * cos(angle_rad);
+        // lon_offset += radius_deg * sin(angle_rad);
+    // }
+    if (fabs(_gps_rot_attack.radiusDeg()) > 1e-6 || fabs(_gps_rot_attack.angleDeg()) > 1e-6) {
+        double angle_rad = math::radians(_gps_rot_attack.angleDeg());
+        double radius_deg = _gps_rot_attack.radiusDeg();
         lat_offset += radius_deg * cos(angle_rad);
         lon_offset += radius_deg * sin(angle_rad);
     }
@@ -3689,7 +3698,7 @@ void GZBridge::navSatCallback(const gz::msgs::NavSat &msg)
     double latitude = msg.latitude_deg() + lat_offset;
     double longitude = msg.longitude_deg() + lon_offset;
     // double altitude = msg.altitude() + _gps_attack_offset.Z() + _gps_attack_rot.Z();
-    double altitude = msg.altitude() + _gps_offset_attack.offsetAltM() + _gps_attack_rot.Z();
+    double altitude = msg.altitude() + _gps_offset_attack.offsetAltM() + _gps_rot_attack.offsetAltM();
     // ======== ATAQUE GPS OFFSET E ROTACAO - FIM ========
 
     float vel_north = msg.velocity_north();
