@@ -46,6 +46,8 @@
 
 #include <atomic>
 
+#include "MotorAttack.hpp"
+
 
 // GZBridge mixing class for ESCs.
 // It is separate from GZBridge to have separate WorkItems and therefore allowing independent scheduling
@@ -74,9 +76,10 @@ public:
 
 	// ====== ADIÇÃO UAVISEC ======
 	void setMotorAttack(int option, int index, double speed) {
-		_motor_attack_option = option;
-		_motor_attack_index = index;
-		_motor_attack_speed = speed;
+		// _motor_attack_option = option;
+		// _motor_attack_index = index;
+		// _motor_attack_speed = speed;
+		_motor_attack.set(option, index, speed);
 	}
 	// ============================
 
@@ -108,9 +111,10 @@ private:
 	pthread_mutex_t _node_mutex;
 
 	// ====== VARIÁVEIS UAVISEC ======
-	int _motor_attack_option{0};
-	int _motor_attack_index{0};
-	double _motor_attack_speed{0.0};
+	// int _motor_attack_option{0};
+	// int _motor_attack_index{0};
+	// double _motor_attack_speed{0.0};
+	MotorAttack _motor_attack;
 	// ===============================
 
 	// ====== MITIGACAO MOTOR - ESTADO ======
