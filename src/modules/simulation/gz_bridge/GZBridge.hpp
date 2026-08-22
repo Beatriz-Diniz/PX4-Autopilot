@@ -41,6 +41,7 @@
 #include "AbsoluteOffsetAttack.hpp"
 #include "RotationOffsetAttack.hpp"
 #include "ImuAttack.hpp"
+#include "LidarAttack.hpp"
 
 #include <px4_platform_common/atomic.h>
 #include <px4_platform_common/defines.h>
@@ -143,7 +144,7 @@ private:
     // void imuAttackCallback(const gz::msgs::Vector3d &msg);
     void motorAttackCallback(const gz::msgs::Vector3d &msg);
     void magAttackCallback(const gz::msgs::Vector3d &msg);
-    void lidarAttackCallback(const gz::msgs::Vector3d &msg);
+    // void lidarAttackCallback(const gz::msgs::Vector3d &msg);
     void streamAttackCallback(const gz::msgs::Int32 &msg);
     // So imprime o aviso encaminhado pelo GstCameraSystem (processo do
     // Gazebo) quando a mitigacao de flip do stream confirma um ataque.
@@ -686,8 +687,9 @@ private:
     int _mag_attack_option{0};
 
     // Ataque de lidar
-    int _lidar_attack_option{0};
-    double _lidar_distance_offset{0.0};
+    // int _lidar_attack_option{0};
+    // double _lidar_distance_offset{0.0};
+    LidarAttack _lidar_attack{_node};
 
     // Ataque de stream
     int _stream_attack_option{0};

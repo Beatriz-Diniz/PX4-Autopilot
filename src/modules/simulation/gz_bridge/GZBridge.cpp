@@ -472,8 +472,11 @@ bool GZBridge::subscribeAttacks(bool required)
         return required ? false : true;
     }
 
-    if (!_node.Subscribe(lidar_attack_topic, &GZBridge::lidarAttackCallback, this)) {
-        PX4_ERR("failed to subscribe to attack topic: %s", lidar_attack_topic.c_str());
+    // if (!_node.Subscribe(lidar_attack_topic, &GZBridge::lidarAttackCallback, this)) {
+        // PX4_ERR("failed to subscribe to attack topic: %s", lidar_attack_topic.c_str());
+        // return required ? false : true;
+    // }
+    if (!_lidar_attack.init(lidar_attack_topic)) {
         return required ? false : true;
     }
 
@@ -603,15 +606,15 @@ void GZBridge::magAttackCallback(const gz::msgs::Vector3d &msg)
 
 // ======== ATAQUE LIDAR - INICIO ========
 // Ataque no LiDAR: configura ativacao e offset de distancia em metros.
-void GZBridge::lidarAttackCallback(const gz::msgs::Vector3d &msg)
-{
+// void GZBridge::lidarAttackCallback(const gz::msgs::Vector3d &msg)
+// {
 
     // msg.x habilita/desabilita o ataque; msg.y define o deslocamento de distancia.
-    _lidar_attack_option = static_cast<int>(msg.x());
-    _lidar_distance_offset = msg.y();
+    // _lidar_attack_option = static_cast<int>(msg.x());
+    // _lidar_distance_offset = msg.y();
 
-    PX4_INFO("Lidar Attack: Option=%d, Offset=%.2f", _lidar_attack_option, _lidar_distance_offset);
-}
+    // PX4_INFO("Lidar Attack: Option=%d, Offset=%.2f", _lidar_attack_option, _lidar_distance_offset);
+// }
 // ======== ATAQUE LIDAR - FIM ========
 
 // ======== ATAQUE IMU - INICIO ========
@@ -4580,9 +4583,10 @@ void GZBridge::laserScantoLidarSensorCallbackImpl(const gz::msgs::LaserScan &msg
 
     // ======== ATAQUE LIDAR - INICIO ========
     // Ataque LiDAR: soma offset a medicao de distancia.
-    if (_lidar_attack_option == 1) {
-        processed_dist += static_cast<float>(_lidar_distance_offset);
-    }
+    // if (_lidar_attack_option == 1) {
+        // processed_dist += static_cast<float>(_lidar_distance_offset);
+    // }
+    processed_dist = _lidar_attack.applyOffset(processed_dist);
     // ======== ATAQUE LIDAR - FIM ========
 
     // Limita a medicao ao intervalo fisico aceito pelo PX4.
@@ -4928,9 +4932,10 @@ void GZBridge::laserScanCallback(const gz::msgs::LaserScan &msg)
             // Reaproveita o mesmo comando/estado do ataque do LiDAR 1D
             // (--lidar 1 <offset>): soma o offset a cada feixe valido antes
             // da reducao em setores.
-            if (_lidar_attack_option == 1) {
-                distance += _lidar_distance_offset;
-            }
+            // if (_lidar_attack_option == 1) {
+                // distance += _lidar_distance_offset;
+            // }
+            distance = _lidar_attack.applyOffset(distance);
             // ======== ATAQUE LIDAR - FIM ========
 
             sum += distance;

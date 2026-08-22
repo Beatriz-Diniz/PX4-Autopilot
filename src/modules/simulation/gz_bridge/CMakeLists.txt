@@ -72,6 +72,8 @@ if (gz-transport_FOUND)
 			${PX4_SOURCE_DIR}/../attacks/ImuAttack.hpp
 			${PX4_SOURCE_DIR}/../attacks/MotorAttack.cpp
 			${PX4_SOURCE_DIR}/../attacks/MotorAttack.hpp
+			${PX4_SOURCE_DIR}/../attacks/LidarAttack.cpp
+			${PX4_SOURCE_DIR}/../attacks/LidarAttack.hpp
 		DEPENDS
 			mixer_module
 			px4_work_queue
