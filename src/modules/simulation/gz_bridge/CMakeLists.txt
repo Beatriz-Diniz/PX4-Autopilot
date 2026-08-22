@@ -78,6 +78,8 @@ if (gz-transport_FOUND)
 			${PX4_SOURCE_DIR}/../attacks/BarometerAttack.hpp
 			${PX4_SOURCE_DIR}/../attacks/MagnetometerAttack.cpp
 			${PX4_SOURCE_DIR}/../attacks/MagnetometerAttack.hpp
+			${PX4_SOURCE_DIR}/../mitigations/GpsMitigation.cpp
+			${PX4_SOURCE_DIR}/../mitigations/GpsMitigation.hpp
 		DEPENDS
 			mixer_module
 			px4_work_queue
@@ -91,6 +93,7 @@ if (gz-transport_FOUND)
             ${PX4_GZ_MSGS_BINARY_DIR}
         PRIVATE
             ${PX4_SOURCE_DIR}/../attacks
+            ${PX4_SOURCE_DIR}/../mitigations
     )
 
 	target_include_directories(modules__simulation__gz_bridge PUBLIC px4_gz_msgs)

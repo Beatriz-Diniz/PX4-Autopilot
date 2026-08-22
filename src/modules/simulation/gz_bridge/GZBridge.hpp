@@ -44,6 +44,7 @@
 #include "LidarAttack.hpp"
 #include "BarometerAttack.hpp"
 #include "MagnetometerAttack.hpp"
+#include "GpsMitigation.hpp"
 
 #include <px4_platform_common/atomic.h>
 #include <px4_platform_common/defines.h>
@@ -154,6 +155,11 @@ private:
     void clockCallback(const gz::msgs::Clock &msg);
     void airspeedCallback(const gz::msgs::AirSpeed &msg);
     void airPressureCallback(const gz::msgs::FluidPressure &msg);
+
+    // Monta o contexto compartilhado (VIO/LPOS/atitude/AGL/distancia/baro)
+    // usado por GpsMitigation, a partir dos caches ja mantidos pelo GZBridge.
+    GpsMitigationContext buildGpsMitigationContext() const;
+
     void imuCallback(const gz::msgs::IMU &msg);
     void poseInfoCallback(const gz::msgs::Pose_V &msg);
     void odometryCallback(const gz::msgs::OdometryWithCovariance &msg);
@@ -170,15 +176,6 @@ private:
     void laserScanCallback(const gz::msgs::LaserScan &msg);
     void opticalFlowCallback(const px4::msgs::OpticalFlow &msg);
     void magnetometerCallback(const gz::msgs::Magnetometer &msg);
-
-    // Publica pseudo-GPS sintetico durante blackout usando dead-reckoning local.
-    void publishBlackoutPseudoGPS(uint64_t timestamp);
-
-    // Pouso unico para qualquer anomalia GPS mitigada.
-    void checkGpsAutoLand(uint64_t timestamp);
-    void checkGpsAutoDisarm(uint64_t timestamp);
-    void publishGpsLandCommand(uint64_t timestamp);
-    void publishGpsDisarmCommand(uint64_t timestamp, bool force_disarm);
 
     // Molde comum de pouso/desarme para IMU, motor e magnetometro (cada uma
     // com uma unica fonte de anomalia e uma unica fonte de posicao confiavel,
@@ -759,35 +756,6 @@ private:
     static constexpr float AUTO_LAND_MAX_ROLL_RAD = 0.0872665f;
     static constexpr uint64_t AUTO_LAND_ATT_LOG_INTERVAL_US = 500000ULL;
 
-    // Estado do filtro
-    double _kf_n_m{0.0};     // Norte estimado [m] relativo a ref.
-    double _kf_e_m{0.0};     // Leste estimado [m]
-    double _kf_alt{0.0};     // Altitude estimada [m]
-    float  _kf_vel_n{0.0f};
-    float  _kf_vel_e{0.0f};
-    float  _kf_vel_d{0.0f};
-
-    // Covariancias do filtro
-    double _kf_P_n{1.0};
-    double _kf_P_e{1.0};
-    double _kf_P_alt{4.0};
-    float  _kf_P_vn{0.1f};
-    float  _kf_P_ve{0.1f};
-    float  _kf_P_vd{0.1f};
-
-    bool     _kf_initialized{false};
-    uint64_t _kf_last_us{0};
-    uint64_t _kf_attack_dur_us{0};
-    bool     _kf_attack_first{true};
-
-    // Pseudo-medicao GPS publicada durante a mitigacao
-    double _jmit_pub_n_m{0.0};
-    double _jmit_pub_e_m{0.0};
-    double _jmit_pub_alt{0.0};
-    float  _jmit_pub_vel_n{0.0f};
-    float  _jmit_pub_vel_e{0.0f};
-    float  _jmit_pub_vel_d{0.0f};
-
     // Altitude barometrica auxiliar
     float _jmit_baro_alt_m{0.0f};
     bool _jmit_baro_valid{false};
@@ -796,27 +764,6 @@ private:
     // Alinhamento entre altitude barometrica e altitude MSL
     double _jmit_baro_alt_offset{0.0};
     bool _jmit_baro_alt_offset_valid{false};
-
-    // ======== MITIGACAO BLACKOUT GPS - ESTADO ========
-    // Indica se ha uma ancora de blackout inicializada e pronta para publicacao.
-    bool     _blackout_anchor_initialized{false};
-    // Posicao ancora capturada no inicio do blackout (coordenadas locais [m]).
-    double   _blackout_anchor_n_m{0.0};
-    double   _blackout_anchor_e_m{0.0};
-    double   _blackout_anchor_alt{0.0};
-    // Posicao estimada do drone durante o blackout (propagada por dead-reckoning).
-    double   _blackout_dr_n_m{0.0};
-    double   _blackout_dr_e_m{0.0};
-    double   _blackout_dr_alt{0.0};
-    // Velocidade no inicio do blackout, usada para o dead-reckoning.
-    float    _blackout_dr_vel_n{0.0f};
-    float    _blackout_dr_vel_e{0.0f};
-    float    _blackout_dr_vel_d{0.0f};
-    // Timestamps para controle do dead-reckoning e da frequencia de publicacao.
-    uint64_t _blackout_start_us{0};
-    uint64_t _blackout_last_pub_us{0};
-    uint64_t _blackout_last_dr_us{0};
-    bool     _blackout_detected{false};
 
     // Ultima medicao GPS real publicada. A deteccao de blackout usa timeout deste cache.
     bool     _gps_real_valid{false};
@@ -881,34 +828,11 @@ private:
     bool     _sim_att_valid{false};
     uint64_t _sim_att_timestamp{0};
 
-    // Contador de confirmacoes consecutivas de contato com o solo via AGL simulado.
-    // Exige N amostras consecutivas abaixo do limiar antes de autorizar o desarme forcado.
-    uint32_t _sim_agl_ground_count{0};
     static constexpr uint32_t SIM_AGL_GROUND_CONFIRM_COUNT = 5;
 
-    // Estado do pouso GPS mitigado.
-    bool     _gps_auto_land_sent{false};
-    bool     _gps_auto_disarm_sent{false};
-    bool     _gps_landing_active{false};
-    bool     _gps_land_source_blackout{false};
-    bool     _gps_land_source_severe_anomaly{false};
-    uint64_t _gps_auto_land_arrival_us{0};
-    uint64_t _gps_auto_land_last_arrived_us{0};
-    uint64_t _gps_land_hold_start_us{0};
-    double   _gps_land_hold_n_m{0.0};
-    double   _gps_land_hold_e_m{0.0};
-    double   _gps_land_start_alt_msl{0.0};
-    double   _gps_land_target_alt_msl{0.0};
-    double   _gps_land_last_alt_msl{0.0};
-    bool     _gps_land_last_alt_valid{false};
-    uint64_t _gps_land_last_update_us{0};
-    bool     _gps_anomaly_severe{false};
-    uint64_t _gps_anomaly_severe_us{0};
-
-    // Heading capturado no momento da chegada ao destino para uso no comando LAND.
-    // Garante que o PX4 receba um heading explicito e pouse sem inclinar.
-    float    _gps_land_heading_rad{0.0f};
-    bool     _gps_land_heading_valid{false};
+    // Substitui todo o estado do KF, blackout e pouso/desarme de GPS. Ver
+    // GpsMitigation.hpp/.cpp (inclui GpsMitigationContext).
+    GpsMitigation _gps_mitigation;
 
     // Modelo de ruido nominal do GPS
     float _gps_pos_noise_n = 0.0f;
