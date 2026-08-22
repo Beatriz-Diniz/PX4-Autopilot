@@ -42,6 +42,7 @@
 #include "RotationOffsetAttack.hpp"
 #include "ImuAttack.hpp"
 #include "LidarAttack.hpp"
+#include "BarometerAttack.hpp"
 
 #include <px4_platform_common/atomic.h>
 #include <px4_platform_common/defines.h>
@@ -150,7 +151,7 @@ private:
     // Gazebo) quando a mitigacao de flip do stream confirma um ataque.
     void streamFlipDetectedCallback(const gz::msgs::Int32 &msg);
     void streamBlackDetectedCallback(const gz::msgs::Int32 &msg);
-    void baroAttackCallback(const gz::msgs::Vector3d &msg);
+    // void baroAttackCallback(const gz::msgs::Vector3d &msg);
 
     // Ataques de jamming GPS
     // void jammingAttackCallback(const gz::msgs::Vector3d &msg);
@@ -696,8 +697,9 @@ private:
     gz::transport::Node::Publisher _stream_cmd_pub;
 
     // Ataque de barometro
-    int _baro_attack_option{0};
-    double _baro_alt_offset{0.0};
+    // int _baro_attack_option{0};
+    // double _baro_alt_offset{0.0};
+    BaroAttack _baro_attack{_node};
 
     // Ataques de jamming GPS
     // int _jamming_attack_type{0}; // 0=OFF, 1=ruido, 2=blackout, 3=pulsado

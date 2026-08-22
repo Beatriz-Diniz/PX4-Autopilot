@@ -485,8 +485,11 @@ bool GZBridge::subscribeAttacks(bool required)
         return required ? false : true;
     }
 
-    if (!_node.Subscribe(baro_attack_topic, &GZBridge::baroAttackCallback, this)) {
-        PX4_ERR("failed to subscribe to attack topic: %s", baro_attack_topic.c_str());
+    // if (!_node.Subscribe(baro_attack_topic, &GZBridge::baroAttackCallback, this)) {
+        // PX4_ERR("failed to subscribe to attack topic: %s", baro_attack_topic.c_str());
+        // return required ? false : true;
+    // }
+    if (!_baro_attack.init(baro_attack_topic)) {
         return required ? false : true;
     }
 
@@ -660,15 +663,15 @@ void GZBridge::magAttackCallback(const gz::msgs::Vector3d &msg)
 
 // ======== ATAQUE BAROMETRO - INICIO ========
 // Ataque no barometro: configura offset de altitude que sera convertido em perturbacao de pressao.
-void GZBridge::baroAttackCallback(const gz::msgs::Vector3d &msg)
-{
+// void GZBridge::baroAttackCallback(const gz::msgs::Vector3d &msg)
+// {
 
     // msg.x habilita/desabilita o ataque; msg.y define offset de altitude em metros.
-    _baro_attack_option = static_cast<int>(msg.x());
-    _baro_alt_offset = msg.y();
+    // _baro_attack_option = static_cast<int>(msg.x());
+    // _baro_alt_offset = msg.y();
 
-    PX4_INFO("Baro Attack: Option=%d, Alt_Offset=%.2f m", _baro_attack_option, _baro_alt_offset);
-}
+    // PX4_INFO("Baro Attack: Option=%d, Alt_Offset=%.2f m", _baro_attack_option, _baro_alt_offset);
+// }
 // ======== ATAQUE BAROMETRO - FIM ========
 
 // ======== ATAQUE GPS JAMMING - INICIO ========
@@ -1231,22 +1234,23 @@ void GZBridge::airPressureCallback(const gz::msgs::FluidPressure &msg)
 
     // ======== ATAQUE BAROMETRO - INICIO ========
     // Ataque barometrico: converte offset de altitude em alteracao fisica de pressao.
-    if (_baro_attack_option == 1) {
+    // if (_baro_attack_option == 1) {
 
-        float altitude_offset_m = static_cast<float>(_baro_alt_offset);
+        // float altitude_offset_m = static_cast<float>(_baro_alt_offset);
 
-        float temperature_k = raw_temperature + 273.15f;
+        // float temperature_k = raw_temperature + 273.15f;
 
-        float adjusted_temperature_k = temperature_k - (0.0065f * altitude_offset_m);
+        // float adjusted_temperature_k = temperature_k - (0.0065f * altitude_offset_m);
 
-        float pressure_ratio = powf(adjusted_temperature_k / temperature_k, 5.2561f);
+        // float pressure_ratio = powf(adjusted_temperature_k / temperature_k, 5.2561f);
 
-        report.pressure = raw_pressure * pressure_ratio;
-        report.temperature = adjusted_temperature_k - 273.15f;
-    } else {
-        report.pressure = raw_pressure;
-        report.temperature = raw_temperature;
-    }
+        // report.pressure = raw_pressure * pressure_ratio;
+        // report.temperature = adjusted_temperature_k - 273.15f;
+    // } else {
+        // report.pressure = raw_pressure;
+        // report.temperature = raw_temperature;
+    // }
+    _baro_attack.apply(raw_pressure, raw_temperature, report.pressure, report.temperature);
     // ======== ATAQUE BAROMETRO - FIM ========
 
     // ======== MITIGACAO BAROMETRO - INICIO ========
