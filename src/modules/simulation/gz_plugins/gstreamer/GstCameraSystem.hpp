@@ -119,8 +119,6 @@ private:
 	bool _initialized {};
 
 	// ataque stream
-	// void onStreamCmd(const gz::msgs::Int32 &msg);
-	// int _stream_attack_option{0};
 	StreamAttack _streamAttack{_node};
 
 	// ======== MITIGACAO GERAL - INICIO ========

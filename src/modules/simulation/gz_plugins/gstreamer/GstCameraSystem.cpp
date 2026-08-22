@@ -179,7 +179,6 @@ void GstCameraSystem::findCameraTopic()
                 _node.Subscribe(_cameraTopic, &GstCameraSystem::onCameraInfo, this);
 
                 // ====== INJEÇÃO UAVISEC: ESCUTAR O COMANDO DE STREAM ======
-                // _node.Subscribe("/gazebo/default/attack/stream_cmd", &GstCameraSystem::onStreamCmd, this);
                 _streamAttack.init();
                 // ==========================================================
 
@@ -446,21 +445,6 @@ void GstCameraSystem::gstThreadFunc()
                     cv::Mat processed_frame = frame.clone();
 
                     // 3. Aplica o ataque baseado na opção recebida
-                    // if (_stream_attack_option == 1) {
-                        // cv::flip(processed_frame, processed_frame, 0); // Inverte a imagem (Flip)
-                    // } 
-                    // else if (_stream_attack_option == 2) {
-                        // Adiciona a máscara/ruído no centro. Tamanho proporcional
-                        // ao frame (1/6 da menor dimensão) em vez de fixo em
-                        // pixels, para continuar visível em qualquer resolução.
-                        // const int squareSize = std::min(_width, _height) / 6;
-                        // cv::Mat mask = cv::Mat::zeros(_height, _width, CV_8UC1);
-                        // cv::Point center(_width/2, _height/2);
-                        // cv::Point topLeft(center.x - squareSize/2, center.y - squareSize/2);
-                        // cv::Rect square(topLeft.x, topLeft.y, squareSize, squareSize);
-                        // cv::rectangle(mask, square, cv::Scalar(255), cv::FILLED);
-                        // processed_frame.setTo(cv::Scalar(0,0,0), mask);
-                    // }
                     _streamAttack.apply(processed_frame, _width, _height);
 
                     // ======== MITIGACAO FLIP - INICIO ========
@@ -721,14 +705,6 @@ void GstCameraSystem::gstThreadFunc()
 
     gzdbg << "GStreamer thread stopped" << std::endl;
 }
-
-//////////////////////////////////////////////////
-// void GstCameraSystem::onStreamCmd(const gz::msgs::Int32 &msg)
-// {
-    // _stream_attack_option = msg.data();
-    // gzdbg << "UAViSec Stream Attack Option Received: " << _stream_attack_option << std::endl;
-// }
-
 
 //////////////////////////////////////////////////
 // ======== MITIGACAO GERAL - INICIO ========

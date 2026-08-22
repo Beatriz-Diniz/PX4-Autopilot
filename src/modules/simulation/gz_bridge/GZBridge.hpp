@@ -43,6 +43,7 @@
 #include "ImuAttack.hpp"
 #include "LidarAttack.hpp"
 #include "BarometerAttack.hpp"
+#include "MagnetometerAttack.hpp"
 
 #include <px4_platform_common/atomic.h>
 #include <px4_platform_common/defines.h>
@@ -140,21 +141,12 @@ private:
 
     // Ataques UAVJamSim
     bool subscribeAttacks(bool required);
-    // void gpsAttackCallback(const gz::msgs::Vector3d &msg);
-    // void gpsRotAttackCallback(const gz::msgs::Vector3d &msg);
-    // void imuAttackCallback(const gz::msgs::Vector3d &msg);
     void motorAttackCallback(const gz::msgs::Vector3d &msg);
-    void magAttackCallback(const gz::msgs::Vector3d &msg);
-    // void lidarAttackCallback(const gz::msgs::Vector3d &msg);
     void streamAttackCallback(const gz::msgs::Int32 &msg);
     // So imprime o aviso encaminhado pelo GstCameraSystem (processo do
     // Gazebo) quando a mitigacao de flip do stream confirma um ataque.
     void streamFlipDetectedCallback(const gz::msgs::Int32 &msg);
     void streamBlackDetectedCallback(const gz::msgs::Int32 &msg);
-    // void baroAttackCallback(const gz::msgs::Vector3d &msg);
-
-    // Ataques de jamming GPS
-    // void jammingAttackCallback(const gz::msgs::Vector3d &msg);
 
     // Mitigacao GPS
     void attackMitigationCallback(const gz::msgs::Vector3d &msg);
@@ -301,16 +293,10 @@ private:
     gz::transport::Node _node;
 
     // Ataques UAVJamSim
-    // gz::math::Vector3d _gps_attack_offset{0.0, 0.0, 0.0};
     AbsoluteOffsetAttack _gps_offset_attack{_node};
-    // gz::math::Vector3d _gps_attack_rot{0.0, 0.0, 0.0};
     RotationOffsetAttack _gps_rot_attack{_node};
 
     // Ataque de IMU
-    // bool _imu_attack_enabled{false};
-    // bool _imu_disabled{false};
-    // double _imu_temp_offsets[6]{0.0, 0.0, 0.0, 0.0, 0.0, 0.0};
-    // double _imu_active_offsets[6]{0.0, 0.0, 0.0, 0.0, 0.0, 0.0};
     ImuAttack _imu_attack{_node};
 
     // ======== MITIGACAO IMU - ESTADO ========
@@ -685,11 +671,9 @@ private:
     // ======== MITIGACAO BAROMETRO - FIM ========
 
     // Ataque de magnetometro
-    int _mag_attack_option{0};
+    MagnetometerAttack _mag_attack{_node};
 
     // Ataque de lidar
-    // int _lidar_attack_option{0};
-    // double _lidar_distance_offset{0.0};
     LidarAttack _lidar_attack{_node};
 
     // Ataque de stream
@@ -697,39 +681,9 @@ private:
     gz::transport::Node::Publisher _stream_cmd_pub;
 
     // Ataque de barometro
-    // int _baro_attack_option{0};
-    // double _baro_alt_offset{0.0};
-    BaroAttack _baro_attack{_node};
+    BarometerAttack _baro_attack{_node};
 
     // Ataques de jamming GPS
-    // int _jamming_attack_type{0}; // 0=OFF, 1=ruido, 2=blackout, 3=pulsado
-    // float _jamming_intensity{0.0f};
-
-    // Ataque 3: jamming pulsado
-    // enum class PulsedJamState {
-    //     IDLE = 0,
-    //     RAMP_UP,
-    //     JAM,
-    //     DECAY,
-    //     VALID
-    // };
-
-    // PulsedJamState _pjam_state{PulsedJamState::IDLE};
-
-    // uint64_t _pjam_state_enter_us{0};
-    // uint64_t _pjam_ramp_us{500000ULL};
-    // uint64_t _pjam_on_us{1000000ULL};
-    // uint64_t _pjam_decay_us{800000ULL};
-    // uint64_t _pjam_off_us{2000000ULL};
-
-    // float _pjam_noise_factor{0.0f};
-
-    // bool _jamming_intermittent_active{false};
-    // bool _jamming_pulsed_initialized{false};
-
-    // Instancia que passa a fazer o trabalho do estado comentado acima
-    // (mesma logica, ja escrita em JammingAttack.hpp/.cpp - nao e logica
-    // nova). O GZBridge so precisa dela para levar o ataque ate o PX4.
     JammingAttack _jamming_attack{_node};
 
     // Mitigacao GPS

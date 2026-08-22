@@ -76,6 +76,8 @@ if (gz-transport_FOUND)
 			${PX4_SOURCE_DIR}/../attacks/LidarAttack.hpp
 			${PX4_SOURCE_DIR}/../attacks/BarometerAttack.cpp
 			${PX4_SOURCE_DIR}/../attacks/BarometerAttack.hpp
+			${PX4_SOURCE_DIR}/../attacks/MagnetometerAttack.cpp
+			${PX4_SOURCE_DIR}/../attacks/MagnetometerAttack.hpp
 		DEPENDS
 			mixer_module
 			px4_work_queue

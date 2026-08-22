@@ -438,26 +438,14 @@ bool GZBridge::subscribeAttacks(bool required)
     // Mesmo mecanismo, para a mitigacao do quadrado preto do stream.
     std::string stream_black_detected_topic = "/gazebo/default/attack/stream_black_detected";
 
-    // if (!_node.Subscribe(gps_attack_topic, &GZBridge::gpsAttackCallback, this)) {
-        // PX4_ERR("failed to subscribe to attack topic: %s", gps_attack_topic.c_str());
-        // return required ? false : true;
-    // }
     if (!_gps_offset_attack.init(gps_attack_topic)) {
         return required ? false : true;
     }
 
-    // if (!_node.Subscribe(gps_rot_attack_topic, &GZBridge::gpsRotAttackCallback, this)) {
-        // PX4_ERR("failed to subscribe to attack topic: %s", gps_rot_attack_topic.c_str());
-        // return required ? false : true;
-    // }
     if (!_gps_rot_attack.init(gps_rot_attack_topic)) {
         return required ? false : true;
     }
 
-    // if (!_node.Subscribe(imu_attack_topic, &GZBridge::imuAttackCallback, this)) {
-        // PX4_ERR("failed to subscribe to attack topic: %s", imu_attack_topic.c_str());
-        // return required ? false : true;
-    // }
     if (!_imu_attack.init(imu_attack_topic)) {
         return required ? false : true;
     }
@@ -467,15 +455,10 @@ bool GZBridge::subscribeAttacks(bool required)
         return required ? false : true;
     }
 
-    if (!_node.Subscribe(mag_attack_topic, &GZBridge::magAttackCallback, this)) {
-        PX4_ERR("failed to subscribe to attack topic: %s", mag_attack_topic.c_str());
+    if (!_mag_attack.init(mag_attack_topic)) {
         return required ? false : true;
     }
 
-    // if (!_node.Subscribe(lidar_attack_topic, &GZBridge::lidarAttackCallback, this)) {
-        // PX4_ERR("failed to subscribe to attack topic: %s", lidar_attack_topic.c_str());
-        // return required ? false : true;
-    // }
     if (!_lidar_attack.init(lidar_attack_topic)) {
         return required ? false : true;
     }
@@ -485,18 +468,10 @@ bool GZBridge::subscribeAttacks(bool required)
         return required ? false : true;
     }
 
-    // if (!_node.Subscribe(baro_attack_topic, &GZBridge::baroAttackCallback, this)) {
-        // PX4_ERR("failed to subscribe to attack topic: %s", baro_attack_topic.c_str());
-        // return required ? false : true;
-    // }
     if (!_baro_attack.init(baro_attack_topic)) {
         return required ? false : true;
     }
 
-    // if (!_node.Subscribe(jamming_attack_topic, &GZBridge::jammingAttackCallback, this)) {
-        // PX4_ERR("failed to subscribe to attack topic: %s", jamming_attack_topic.c_str());
-        // return required ? false : true;
-    // }
     if (!_jamming_attack.init(jamming_attack_topic)) {
         return required ? false : true;
     }
@@ -517,26 +492,6 @@ bool GZBridge::subscribeAttacks(bool required)
     return true;
 }
 // ======== TOPICOS DE ATAQUE E MITIGACAO - FIM ========
-
-// ======== ATAQUE GPS OFFSET - INICIO ========
-// Ataque GPS por offset: atualiza deslocamentos artificiais de latitude, longitude e altitude.
-// void GZBridge::gpsAttackCallback(const gz::msgs::Vector3d &msg)
-// {
-
-    // msg.x/y/z representam offsets aplicados diretamente a latitude, longitude e altitude.
-    // _gps_attack_offset.Set(msg.x(), msg.y(), msg.z());
-// }
-// ======== ATAQUE GPS OFFSET - FIM ========
-
-// ======== ATAQUE GPS ROTACAO - INICIO ========
-// Ataque GPS por rotacao: configura magnitude, angulo e offset vertical da perturbacao circular.
-// void GZBridge::gpsRotAttackCallback(const gz::msgs::Vector3d &msg)
-// {
-
-    // msg.x define o raio em graus, msg.y o angulo e msg.z o deslocamento vertical.
-    // _gps_attack_rot.Set(msg.x(), msg.y(), msg.z());
-// }
-// ======== ATAQUE GPS ROTACAO - FIM ========
 
 // ======== ATAQUE STREAM DE CAMERA - INICIO ========
 // Ataque no stream de camera: traduz o comando UAVJamSim para o plugin de camera do Gazebo.
@@ -596,148 +551,6 @@ void GZBridge::motorAttackCallback(const gz::msgs::Vector3d &msg)
     _mixing_interface_esc.setMotorAttack(option, index, speed);
 }
 // ======== ATAQUE MOTOR - FIM ========
-
-// ======== ATAQUE MAGNETOMETRO - INICIO ========
-// Ataque no magnetometro: seleciona o modo de alteracao aplicado durante a publicacao do sensor.
-void GZBridge::magAttackCallback(const gz::msgs::Vector3d &msg)
-{
-
-    // A opcao e aplicada posteriormente em magnetometerCallback().
-    _mag_attack_option = static_cast<int>(msg.x());
-}
-// ======== ATAQUE MAGNETOMETRO - FIM ========
-
-// ======== ATAQUE LIDAR - INICIO ========
-// Ataque no LiDAR: configura ativacao e offset de distancia em metros.
-// void GZBridge::lidarAttackCallback(const gz::msgs::Vector3d &msg)
-// {
-
-    // msg.x habilita/desabilita o ataque; msg.y define o deslocamento de distancia.
-    // _lidar_attack_option = static_cast<int>(msg.x());
-    // _lidar_distance_offset = msg.y();
-
-    // PX4_INFO("Lidar Attack: Option=%d, Offset=%.2f", _lidar_attack_option, _lidar_distance_offset);
-// }
-// ======== ATAQUE LIDAR - FIM ========
-
-// ======== ATAQUE IMU - INICIO ========
-// Ataque na IMU: habilita offsets, desabilitacao total ou limpeza das perturbacoes por eixo.
-// void GZBridge::imuAttackCallback(const gz::msgs::Vector3d &msg)
-// {
-    // int option = static_cast<int>(msg.x());
-    // int index = static_cast<int>(msg.y());
-    // double offset = msg.z();
-
-    // Indices validos: 0..2 para acelerometro e 3..5 para giroscopio.
-    // if (index < 0 || index > 5) return;
-
-    // Opcoes: 1 habilita offsets, 2 zera a IMU, 3 configura offset, 4 limpa, 5 desativa.
-    // switch (option) {
-        // case 1:
-            // _imu_attack_enabled = true;
-            // _imu_disabled = false;
-            // for (int i = 0; i < 6; i++) {
-                // _imu_active_offsets[i] = _imu_temp_offsets[i];
-            // }
-            // break;
-        // case 2:
-            // _imu_disabled = true;
-            // _imu_attack_enabled = false;
-            // break;
-        // case 3:
-            // _imu_temp_offsets[index] = offset;
-            // break;
-        // case 4:
-            // for (int i = 0; i < 6; i++) {
-                // _imu_temp_offsets[i] = 0.0;
-                // _imu_active_offsets[i] = 0.0;
-            // }
-            // break;
-        // case 5:
-            // _imu_attack_enabled = false;
-            // _imu_disabled = false;
-            // break;
-    // }
-// }
-// ======== ATAQUE IMU - FIM ========
-
-// ======== ATAQUE BAROMETRO - INICIO ========
-// Ataque no barometro: configura offset de altitude que sera convertido em perturbacao de pressao.
-// void GZBridge::baroAttackCallback(const gz::msgs::Vector3d &msg)
-// {
-
-    // msg.x habilita/desabilita o ataque; msg.y define offset de altitude em metros.
-    // _baro_attack_option = static_cast<int>(msg.x());
-    // _baro_alt_offset = msg.y();
-
-    // PX4_INFO("Baro Attack: Option=%d, Alt_Offset=%.2f m", _baro_attack_option, _baro_alt_offset);
-// }
-// ======== ATAQUE BAROMETRO - FIM ========
-
-// ======== ATAQUE GPS JAMMING - INICIO ========
-// Ataque de jamming GPS: seleciona ruido continuo, blackout ou jamming pulsado.
-// void GZBridge::jammingAttackCallback(const gz::msgs::Vector3d &msg)
-// {
-    // msg.x seleciona o tipo de jamming e msg.y define a intensidade.
-    // _jamming_attack_type = static_cast<int>(msg.x());
-    // _jamming_intensity   = static_cast<float>(msg.y());
-
-    // ======== ATAQUE GPS JAMMING DESATIVADO - INICIO ========
-    // Tipo 0: desativa o jamming e reinicia a maquina de estados pulsada.
-    // if (_jamming_attack_type == 0) {
-
-        // _pjam_state                = PulsedJamState::IDLE;
-        // _pjam_state_enter_us       = 0;
-        // _jamming_pulsed_initialized = false;
-        // _jamming_intermittent_active = false;
-        // _pjam_noise_factor         = 0.0f;
-        // PX4_INFO("[Jamming] DISABLED");
-    // ======== ATAQUE GPS JAMMING DESATIVADO - FIM ========
-
-    // ======== ATAQUE 1 GPS NOISE JAMMING - INICIO ========
-    // Tipo 1: jamming por ruido continuo aplicado a posicao, altitude e velocidade GPS.
-    // } else if (_jamming_attack_type == 1) {
-        // PX4_WARN("[Jamming] NOISE: ENABLED, Intensity=%.2f",
-                 // static_cast<double>(_jamming_intensity));
-    // ======== ATAQUE 1 GPS NOISE JAMMING - FIM ========
-
-    // ======== ATAQUE 2 GPS BLACKOUT - INICIO ========
-    // Tipo 2: blackout, simulando perda total de atualizacao GPS.
-    // } else if (_jamming_attack_type == 2) {
-        // PX4_WARN("[Jamming] BLACKOUT: ENABLED (Signal Drop)");
-    // ======== ATAQUE 2 GPS BLACKOUT - FIM ========
-
-    // ======== ATAQUE 3 GPS PULSED JAMMING - INICIO ========
-    // Tipo 3: jamming pulsado com subida, bloqueio, decaimento e recuperacao.
-    // } else if (_jamming_attack_type == 3) {
-
-        // A intensidade controla a duracao do bloqueio total dentro do ciclo pulsado.
-        // float clamped = math::constrain(_jamming_intensity, 0.1f, 1.0f);
-
-        // _pjam_ramp_us  = 500000ULL;
-        // _pjam_on_us    = static_cast<uint64_t>(clamped * 10.0f * 1e6f);
-        // _pjam_decay_us = 800000ULL;
-        // _pjam_off_us   = 2000000ULL;
-
-        // if (!_jamming_pulsed_initialized) {
-            // _pjam_state              = PulsedJamState::RAMP_UP;
-            // _pjam_state_enter_us     = hrt_absolute_time();
-            // _jamming_pulsed_initialized = true;
-            // _jamming_intermittent_active = false;
-            // _pjam_noise_factor       = 0.0f;
-        // }
-
-        // PX4_WARN("[Jamming] PULSED ENABLED | Intensity=%.2f"
-                 // " | ramp=%llums on=%llums decay=%llums off=%llums",
-                 // static_cast<double>(clamped),
-                 // (unsigned long long)(_pjam_ramp_us  / 1000),
-                 // (unsigned long long)(_pjam_on_us    / 1000),
-                 // (unsigned long long)(_pjam_decay_us / 1000),
-                 // (unsigned long long)(_pjam_off_us   / 1000));
-    // }
-    // ======== ATAQUE 3 GPS PULSED JAMMING - FIM ========
-// }
-// ======== ATAQUE GPS JAMMING - FIM ========
 
 // ======== MITIGACAO GPS - INICIO ========
 // Controle da mitigacao GPS: liga/desliga o filtro de rejeicao e reinicia o estado da ancora.
@@ -1016,23 +829,8 @@ void GZBridge::magnetometerCallback(const gz::msgs::Magnetometer &msg)
     float raw_y = -msg.field_tesla().x();
     float raw_z = msg.field_tesla().z();
 
-    // ======== ATAQUE MAGNETOMETRO - INICIO ========
     // Ataque de magnetometro: opcao 1 troca os eixos X e Y.
-    switch (_mag_attack_option) {
-        case 1:
-        report.x = raw_y;
-        report.y = raw_x;
-        report.z = raw_z;
-
-        break;
-
-    default:
-        report.x = raw_x;
-        report.y = raw_y;
-        report.z = raw_z;
-        break;
-    }
-    // ======== ATAQUE MAGNETOMETRO - FIM ========
+    _mag_attack.apply(raw_x, raw_y, raw_z, report.x, report.y, report.z);
 
     // ======== MITIGACAO MAGNETOMETRO - INICIO ========
     // Deteccao de anomalia no sinal publicado do sensor, sem consultar
@@ -1232,26 +1030,8 @@ void GZBridge::airPressureCallback(const gz::msgs::FluidPressure &msg)
     float raw_pressure = msg.pressure();
     float raw_temperature = this->_temperature;
 
-    // ======== ATAQUE BAROMETRO - INICIO ========
     // Ataque barometrico: converte offset de altitude em alteracao fisica de pressao.
-    // if (_baro_attack_option == 1) {
-
-        // float altitude_offset_m = static_cast<float>(_baro_alt_offset);
-
-        // float temperature_k = raw_temperature + 273.15f;
-
-        // float adjusted_temperature_k = temperature_k - (0.0065f * altitude_offset_m);
-
-        // float pressure_ratio = powf(adjusted_temperature_k / temperature_k, 5.2561f);
-
-        // report.pressure = raw_pressure * pressure_ratio;
-        // report.temperature = adjusted_temperature_k - 273.15f;
-    // } else {
-        // report.pressure = raw_pressure;
-        // report.temperature = raw_temperature;
-    // }
     _baro_attack.apply(raw_pressure, raw_temperature, report.pressure, report.temperature);
-    // ======== ATAQUE BAROMETRO - FIM ========
 
     // ======== MITIGACAO BAROMETRO - INICIO ========
     // Deteccao de anomalia na altitude implicita na pressao publicada, sem
@@ -1488,22 +1268,8 @@ void GZBridge::imuCallback(const gz::msgs::IMU &msg)
     gyro.temperature = NAN;
     gyro.samples = 1;
 
-    // ======== ATAQUE IMU - INICIO ========
     // Ataque IMU: pode zerar completamente o sensor ou somar offsets configurados por eixo.
-    // if (_imu_disabled) {
-        // accel.x = 0.0f; accel.y = 0.0f; accel.z = 0.0f;
-        // gyro.x = 0.0f; gyro.y = 0.0f; gyro.z = 0.0f;
-    // } else if (_imu_attack_enabled) {
-
-        // accel.x += static_cast<float>(_imu_active_offsets[0]);
-        // accel.y += static_cast<float>(_imu_active_offsets[1]);
-        // accel.z += static_cast<float>(_imu_active_offsets[2]);
-        // gyro.x += static_cast<float>(_imu_active_offsets[3]);
-        // gyro.y += static_cast<float>(_imu_active_offsets[4]);
-        // gyro.z += static_cast<float>(_imu_active_offsets[5]);
-    // }
     _imu_attack.apply(accel.x, accel.y, accel.z, gyro.x, gyro.y, gyro.z);
-    // ======== ATAQUE IMU - FIM ========
 
     // ======== MITIGACAO IMU - INICIO ========
     // Deteccao de anomalia no sinal publicado do sensor (accel/gyro ja com o
@@ -3657,11 +3423,9 @@ void GZBridge::navSatCallback(const gz::msgs::NavSat &msg)
 {
     const uint64_t timestamp = hrt_absolute_time();
 
-    // ======== ATAQUE 2 GPS BLACKOUT - INICIO ========
     // Ataque 2: blackout GPS. O ataque apenas bloqueia a publicacao do GPS real.
     // A mitigacao detecta a falha por timeout
     // da ultima publicacao GPS real no imuCallback().
-    // if (_jamming_attack_type == 2) {
     if (_jamming_attack.isBlackoutActive()) {
 
         // Garante que a origem de projecao local exista para permitir reprojecao do pseudo-GPS.
@@ -3672,7 +3436,6 @@ void GZBridge::navSatCallback(const gz::msgs::NavSat &msg)
 
         return;
     }
-    // ======== ATAQUE 2 GPS BLACKOUT - FIM ========
 
     // Apos o desarme, interrompe a publicacao de medicoes GPS no chao.
     if (_gps_auto_disarm_sent) {
@@ -3686,19 +3449,10 @@ void GZBridge::navSatCallback(const gz::msgs::NavSat &msg)
         return;
     }
 
-    // ======== ATAQUE GPS OFFSET E ROTACAO - INICIO ========
     // Ataques GPS por offset e rotacao sao aplicados antes do ruido nominal.
-    // double lat_offset = _gps_attack_offset.X();
-    // double lon_offset = _gps_attack_offset.Y();
     double lat_offset = _gps_offset_attack.offsetLatDeg();
     double lon_offset = _gps_offset_attack.offsetLonDeg();
 
-    // if (fabs(_gps_attack_rot.X()) > 1e-6 || fabs(_gps_attack_rot.Y()) > 1e-6) {
-        // double angle_rad = math::radians(_gps_attack_rot.Y());
-        // double radius_deg = _gps_attack_rot.X();
-        // lat_offset += radius_deg * cos(angle_rad);
-        // lon_offset += radius_deg * sin(angle_rad);
-    // }
     if (fabs(_gps_rot_attack.radiusDeg()) > 1e-6 || fabs(_gps_rot_attack.angleDeg()) > 1e-6) {
         double angle_rad = math::radians(_gps_rot_attack.angleDeg());
         double radius_deg = _gps_rot_attack.radiusDeg();
@@ -3708,9 +3462,7 @@ void GZBridge::navSatCallback(const gz::msgs::NavSat &msg)
 
     double latitude = msg.latitude_deg() + lat_offset;
     double longitude = msg.longitude_deg() + lon_offset;
-    // double altitude = msg.altitude() + _gps_attack_offset.Z() + _gps_attack_rot.Z();
     double altitude = msg.altitude() + _gps_offset_attack.offsetAltM() + _gps_rot_attack.offsetAltM();
-    // ======== ATAQUE GPS OFFSET E ROTACAO - FIM ========
 
     float vel_north = msg.velocity_north();
     float vel_east = msg.velocity_east();
@@ -3728,28 +3480,8 @@ void GZBridge::navSatCallback(const gz::msgs::NavSat &msg)
     // Ruido nominal do receptor GPS simulado.
     addGpsNoise(latitude, longitude, altitude, vel_north, vel_east, vel_down);
 
-    // ======== ATAQUE 1 GPS NOISE JAMMING - INICIO ========
     // Ataque 1: jamming por ruido continuo. A perturbacao afeta posicao, altitude e velocidade.
-    // if (_jamming_attack_type == 1) {
-
-        // Ruido horizontal em metros convertido para latitude/longitude.
-        // const double lat_rad = math::radians(latitude);
-        // const double noise_n_m = static_cast<double>(generate_wgn() * _jamming_intensity * 10.0f);
-        // const double noise_e_m = static_cast<double>(generate_wgn() * _jamming_intensity * 10.0f);
-
-        // latitude  += math::degrees(noise_n_m / CONSTANTS_RADIUS_OF_EARTH);
-        // longitude += math::degrees(noise_e_m / (CONSTANTS_RADIUS_OF_EARTH * cos(lat_rad)));
-
-        // O canal vertical recebe ruido maior para representar a menor precisao vertical do GPS.
-        // altitude += static_cast<double>(generate_wgn() * _jamming_intensity * 30.0f);
-
-        // Velocidades tambem sao perturbadas para simular uma medicao GPS dinamicamente inconsistente.
-        // vel_north += generate_wgn() * _jamming_intensity * 10.0f;
-        // vel_east += generate_wgn() * _jamming_intensity * 10.0f;
-        // vel_down += generate_wgn() * _jamming_intensity * 10.0f;
-    // }
     _jamming_attack.applyNoiseJamming(latitude, longitude, altitude, vel_north, vel_east, vel_down);
-    // ======== ATAQUE 1 GPS NOISE JAMMING - FIM ========
 
     // ======== MITIGACAO GPS - INICIO ========
     bool gps_anomalous_now = false;
@@ -4154,104 +3886,7 @@ void GZBridge::navSatCallback(const gz::msgs::NavSat &msg)
     checkGpsAutoDisarm(timestamp);
     // ======== MITIGACAO DE POUSO GPS - FIM ========
 
-    // ======== ATAQUE 3 GPS PULSED JAMMING - INICIO ========
     // Ataque 3: maquina de estados do jamming pulsado.
-    // if (_jamming_attack_type == 3 && _jamming_pulsed_initialized) {
-        // const uint64_t now     = hrt_absolute_time();
-        // const uint64_t elapsed = now - _pjam_state_enter_us;
-
-        // Estados: subida do jammer, bloqueio total, decaimento e periodo valido.
-        // switch (_pjam_state) {
-
-        // case PulsedJamState::RAMP_UP: {
-            // RAMP_UP: o sinal piora gradualmente e o ruido cresce de 0 ate 100%.
-
-            // _pjam_noise_factor = math::constrain(
-                // static_cast<float>(elapsed) / static_cast<float>(_pjam_ramp_us),
-                // 0.0f, 1.0f);
-            // _jamming_intermittent_active = true;
-
-            // if (elapsed >= _pjam_ramp_us) {
-                // _pjam_state          = PulsedJamState::JAM;
-                // _pjam_state_enter_us = now;
-                // _pjam_noise_factor   = 1.0f;
-                // PX4_WARN("[UAVJamSim Jamming] >>> JAM ON <<< (%.1f s)",
-                         // static_cast<double>(_pjam_on_us) / 1e6);
-            // }
-
-            // break;
-        // }
-
-        // case PulsedJamState::JAM: {
-            // JAM: bloqueio total; nenhuma mensagem GPS e publicada enquanto o pulso esta ativo.
-            // Durante o pouso ja iniciado, mantem a pseudo-medicao de pouso sendo publicada.
-            // _pjam_noise_factor           = 1.0f;
-            // _jamming_intermittent_active = true;
-
-            // if (elapsed >= _pjam_on_us) {
-                // _pjam_state          = PulsedJamState::DECAY;
-                // _pjam_state_enter_us = now;
-                // PX4_INFO("[UAVJamSim Jamming] <<< JAM OFF — DECAY >>>");
-            // } else {
-                // if (!_gps_landing_active) {
-                    // return;
-                // }
-            // }
-            // break;
-        // }
-
-        // case PulsedJamState::DECAY: {
-            // DECAY: o jammer deixa de bloquear e o ruido reduz gradualmente.
-
-            // _pjam_noise_factor = math::constrain(
-                // 1.0f - static_cast<float>(elapsed) / static_cast<float>(_pjam_decay_us),
-                // 0.0f, 1.0f);
-            // _jamming_intermittent_active = (_pjam_noise_factor > 0.05f);
-
-            // if (elapsed >= _pjam_decay_us) {
-                // _pjam_state          = PulsedJamState::VALID;
-                // _pjam_state_enter_us = now;
-                // _pjam_noise_factor   = 0.0f;
-                // _jamming_intermittent_active = false;
-                // PX4_INFO("[UAVJamSim Jamming] <<< GPS VALID — recovery >>>");
-            // }
-            // break;
-        // }
-
-        // case PulsedJamState::VALID: {
-            // VALID: janela com GPS limpo antes do proximo pulso.
-            // _pjam_noise_factor           = 0.0f;
-            // _jamming_intermittent_active = false;
-
-            // if (elapsed >= _pjam_off_us) {
-
-                // _pjam_state          = PulsedJamState::RAMP_UP;
-                // _pjam_state_enter_us = now;
-                // PX4_WARN("[UAVJamSim Jamming] >>> NEW PULSE — RAMP_UP >>>");
-            // }
-            // break;
-        // }
-
-        // default:
-            // break;
-        // }
-
-        // Em RAMP_UP/DECAY, injeta ruido proporcional a potencia instantanea do pulso.
-        // Durante o pouso, mantem a pseudo-medicao sem ruido pulsado adicional.
-        // if (_pjam_noise_factor > 0.0f) {
-            // const float noise_factor = _pjam_noise_factor;
-            // const double lat_rad = math::radians(latitude);
-            // const double noise_n_m = static_cast<double>(generate_wgn() * noise_factor * _jamming_intensity * 1000.0f);
-            // const double noise_e_m = static_cast<double>(generate_wgn() * noise_factor * _jamming_intensity * 1000.0f);
-
-            // latitude  += math::degrees(noise_n_m / CONSTANTS_RADIUS_OF_EARTH);
-            // longitude += math::degrees(noise_e_m / (CONSTANTS_RADIUS_OF_EARTH * cos(lat_rad)));
-            // altitude  += static_cast<double>(generate_wgn() * noise_factor * _jamming_intensity * 80.0f);
-            // vel_north += generate_wgn() * noise_factor * _jamming_intensity * 15.0f;
-            // vel_east  += generate_wgn() * noise_factor * _jamming_intensity * 15.0f;
-            // vel_down  += generate_wgn() * noise_factor * _jamming_intensity * 15.0f;
-        // }
-    // }
     _jamming_attack.tickPulsedJamming(hrt_absolute_time(), latitude, longitude, altitude,
                        vel_north, vel_east, vel_down);
 
@@ -4261,7 +3896,6 @@ void GZBridge::navSatCallback(const gz::msgs::NavSat &msg)
     if (_jamming_attack.isPulsedFullyJammed() && !_gps_landing_active) {
         return;
     }
-    // ======== ATAQUE 3 GPS PULSED JAMMING - FIM ========
 
     device::Device::DeviceId id{};
     id.devid_s.bus_type = device::Device::DeviceBusType::DeviceBusType_SIMULATION;
@@ -4288,39 +3922,8 @@ void GZBridge::navSatCallback(const gz::msgs::NavSat &msg)
         sensor_gps.vdop     = 100.f;
     }
 
-    // ======== ATAQUE 3 GPS PULSED JAMMING - INICIO ========
-    // No jamming pulsado, degrada eph/epv/HDOP/VDOP e reduz satelites durante RAMP_UP/DECAY.
-    // if (_pjam_noise_factor > 0.0f) {
-        // const float noise_factor = _pjam_noise_factor;
-
-        // sensor_gps.eph  = sensor_gps.eph  + noise_factor * (15.0f  - sensor_gps.eph);
-        // sensor_gps.epv  = sensor_gps.epv  + noise_factor * (25.0f  - sensor_gps.epv);
-        // sensor_gps.hdop = sensor_gps.hdop + noise_factor * (8.0f   - sensor_gps.hdop);
-        // sensor_gps.vdop = sensor_gps.vdop + noise_factor * (12.0f  - sensor_gps.vdop);
-
-        // int base_satellites = _sim_gps_used.get();
-        // sensor_gps.satellites_used = static_cast<uint8_t>(
-            // math::constrain(static_cast<int>(base_satellites - static_cast<int>(noise_factor * (base_satellites - 3))),
-                            // 3, base_satellites));
-    // } else {
-        // sensor_gps.satellites_used = _sim_gps_used.get();
-    // }
-    // ======== ATAQUE 3 GPS PULSED JAMMING - FIM ========
-
-    // ======== QUALIDADE GPS DURANTE NOISE JAMMING - INICIO ========
-    // O GPS ruidoso continua valido, mas com incerteza maior para evitar
-    // que o estimador trate saltos grandes como medicoes precisas.
-    // if (_jamming_attack_type == 1) {
-        // sensor_gps.eph  = math::max(sensor_gps.eph, 8.0f);
-        // sensor_gps.epv  = math::max(sensor_gps.epv, 12.0f);
-        // sensor_gps.hdop = math::max(sensor_gps.hdop, 2.5f);
-        // sensor_gps.vdop = math::max(sensor_gps.vdop, 3.5f);
-    // }
-    // ======== QUALIDADE GPS DURANTE NOISE JAMMING - FIM ========
-
-    // Encanamento: os dois blocos comentados acima ja estao implementados,
-    // idênticos, dentro de JammingAttack::degradeGpsQuality (inclui o
-    // fallback nominal de satellites_used quando nenhum ataque esta ativo).
+    // Degrada eph/epv/hdop/vdop/satellites_used de acordo com o ataque de
+    // jamming ativo (pulsado ou ruido continuo).
     _jamming_attack.degradeGpsQuality(sensor_gps, _sim_gps_used.get());
 
 
@@ -4395,7 +3998,6 @@ void GZBridge::navSatCallback(const gz::msgs::NavSat &msg)
     // checagem, o valor contaminado passaria como "limpo" para quem usa
     // este cache como referencia independente (mitigacao de barometro,
     // entre outras).
-    // if (!is_anchor_now && !_jamming_intermittent_active) {
     if (!is_anchor_now && !_jamming_attack.isPulsedIntermittentActive()) {
         float gps_n_m = 0.0f;
         float gps_e_m = 0.0f;
@@ -4585,13 +4187,8 @@ void GZBridge::laserScantoLidarSensorCallbackImpl(const gz::msgs::LaserScan &msg
 
     float processed_dist = raw_dist;
 
-    // ======== ATAQUE LIDAR - INICIO ========
     // Ataque LiDAR: soma offset a medicao de distancia.
-    // if (_lidar_attack_option == 1) {
-        // processed_dist += static_cast<float>(_lidar_distance_offset);
-    // }
     processed_dist = _lidar_attack.applyOffset(processed_dist);
-    // ======== ATAQUE LIDAR - FIM ========
 
     // Limita a medicao ao intervalo fisico aceito pelo PX4.
     report.current_distance = math::constrain(processed_dist, report.min_distance, report.max_distance);
@@ -4932,15 +4529,10 @@ void GZBridge::laserScanCallback(const gz::msgs::LaserScan &msg)
                 continue;
             }
 
-            // ======== ATAQUE LIDAR 2D - INICIO ========
             // Reaproveita o mesmo comando/estado do ataque do LiDAR 1D
             // (--lidar 1 <offset>): soma o offset a cada feixe valido antes
             // da reducao em setores.
-            // if (_lidar_attack_option == 1) {
-                // distance += _lidar_distance_offset;
-            // }
             distance = _lidar_attack.applyOffset(distance);
-            // ======== ATAQUE LIDAR - FIM ========
 
             sum += distance;
             samples_used_in_sector++;
