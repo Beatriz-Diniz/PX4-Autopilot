@@ -45,6 +45,8 @@
 #include "BarometerAttack.hpp"
 #include "MagnetometerAttack.hpp"
 #include "GpsMitigation.hpp"
+#include "ImuMitigation.hpp"
+#include "MagnetometerMitigation.hpp"
 
 #include <px4_platform_common/atomic.h>
 #include <px4_platform_common/defines.h>
@@ -200,9 +202,10 @@ private:
     void publishGenericLandCommand(uint64_t timestamp, double land_hold_n_m, double land_hold_e_m, const char *log_tag);
     void publishGenericDisarmCommand(uint64_t timestamp, bool force_disarm, const char *log_tag);
 
-    // Pouso/desarme para a mitigacao de IMU (wrapper sobre o molde generico).
-    void checkImuAutoLand(uint64_t timestamp);
-    void checkImuAutoDisarm(uint64_t timestamp);
+    // Pouso/desarme para a mitigacao de IMU: agora dedicado, dentro de
+    // ImuMitigation (ver checkAutoLand/checkAutoDisarm em ImuMitigation.hpp).
+    // void checkImuAutoLand(uint64_t timestamp);
+    // void checkImuAutoDisarm(uint64_t timestamp);
 
     // Pouso/desarme para a mitigacao de motor (wrapper sobre o molde generico).
     // O gatilho vem da anomalia de atuacao detectada e ja corrigida em
@@ -211,9 +214,10 @@ private:
     void checkMotorAutoLand(uint64_t timestamp);
     void checkMotorAutoDisarm(uint64_t timestamp);
 
-    // Pouso/desarme para a mitigacao de magnetometro (wrapper sobre o molde generico).
-    void checkMagAutoLand(uint64_t timestamp);
-    void checkMagAutoDisarm(uint64_t timestamp);
+    // Pouso/desarme para a mitigacao de magnetometro: agora dedicado, dentro
+    // de MagnetometerMitigation (ver checkAutoLand/checkAutoDisarm).
+    // void checkMagAutoLand(uint64_t timestamp);
+    // void checkMagAutoDisarm(uint64_t timestamp);
 
     // Pouso/desarme para a mitigacao de LiDAR (wrapper sobre o molde generico).
     void checkLidarAutoLand(uint64_t timestamp);
@@ -297,102 +301,23 @@ private:
     ImuAttack _imu_attack{_node};
 
     // ======== MITIGACAO IMU - ESTADO ========
+    // Substitui a linha de base, deteccao, cache de substituicao VIO e
+    // referencia cruzada com GPS. Ver ImuMitigation.hpp/.cpp. O que fica
+    // aqui (abaixo) e so a nota de que o pouso de IMU deixou de ser
+    // compartilhado com motor/magnetometro/lidar/barometro - agora vive
+    // inteiro dentro de ImuMitigation (ver checkAutoLand/checkAutoDisarm).
+    ImuMitigation _imu_mitigation;
 
-    // Linha de base adaptativa da leitura do sensor (media do acelerometro fixa
-    // na gravidade local; variancia e media do giroscopio se adaptam). Atualizada
-    // apenas com amostras consideradas saudaveis.
-    bool   _imu_baseline_initialized{false};
-    double _imu_accel_norm_ewma{9.80665};
-    double _imu_accel_norm_var_ewma{1.0};
-    double _imu_gyro_norm_ewma{0.0};
-    double _imu_gyro_norm_var_ewma{0.02};
-
-    bool     _imu_anomaly_active{false};
-    uint64_t _imu_anomaly_start_us{0};
-    uint64_t _imu_recovery_start_us{0};
-
-    // Marca se o veiculo ja esteve armado e voando (nao pousado) desde que a
-    // mitigacao foi habilitada. A deteccao so roda depois disso.
-    bool _imu_ever_armed{false};
-
-    // Suspende a deteccao por uma janela curta logo apos a transicao de
-    // armado para desarmado (o corte do empuxo pode gerar uma leitura
-    // transitoria de forca especifica proxima de zero, fisicamente identica
-    // a uma IMU zerada, sem relacao com ataque).
-    bool     _imu_prev_armed{false};
-    uint64_t _imu_land_settle_until_us{0};
-    static constexpr uint64_t IMU_LAND_SETTLE_US = 1000000ULL; // 1 s
-
-    // Limites fisicos de forca especifica: proximo de zero indica sensor zerado;
-    // muito acima do plausivel indica offset/spoofing grosseiro.
-    static constexpr double IMU_ACCEL_NORM_MIN_MS2   = 2.0;   // ~0.2 g
-    static constexpr double IMU_ACCEL_NORM_MAX_MS2   = 39.0;  // ~4 g
-    // Limiar estatistico (z-score) sobre a linha de base adaptativa do sinal IMU.
-    static constexpr double IMU_ZSCORE_THRESHOLD     = 6.0;
-    // Limiar de severidade: acima deste z-score, a anomalia e confirmada com a
-    // janela reduzida (IMU_ANOMALY_CONFIRM_SEVERE_US) em vez da janela padrao.
-    static constexpr double IMU_ZSCORE_SEVERE_THRESHOLD = 12.0;
-    static constexpr double IMU_BASELINE_ALPHA       = 0.01;
-    // Tempo minimo sustentado para confirmar anomalia/recuperacao.
-    static constexpr uint64_t IMU_ANOMALY_CONFIRM_US  = 300000ULL;  // 300 ms
-    static constexpr uint64_t IMU_ANOMALY_CONFIRM_SEVERE_US = 20000ULL; // 20 ms
-    static constexpr uint64_t IMU_RECOVERY_CONFIRM_US = 500000ULL;  // 500 ms
-
-    // Pouso automatico mitigado por anomalia de IMU (mesma logica do pouso GPS).
-    // A altitude de descida fica sob controle do modo LAND do PX4 (nao e
-    // sintetizada aqui como no pouso de blackout GPS), entao so a posicao
-    // horizontal de chegada precisa ser mantida.
-    bool     _imu_landing_active{false};
-    bool     _imu_auto_land_sent{false};
-    bool     _imu_auto_disarm_sent{false};
-    uint64_t _imu_auto_land_arrival_us{0};
-    uint64_t _imu_auto_land_last_arrived_us{0};
-    double   _imu_land_hold_n_m{0.0};
-    double   _imu_land_hold_e_m{0.0};
-    // Contador de confirmacoes consecutivas de contato com o solo via AGL simulado (uso exclusivo do pouso IMU).
-    uint32_t _imu_sim_agl_ground_count{0};
-
-    // Referencia cruzada com o GPS real: aceleracao horizontal estimada por
-    // diferenca finita da velocidade GPS, usada para validar a aceleracao
-    // horizontal medida pelo acelerometro.
-    bool     _imu_ref_gps_prev_valid{false};
-    uint64_t _imu_ref_gps_prev_us{0};
-    float    _imu_ref_gps_prev_vel_n{0.0f};
-    float    _imu_ref_gps_prev_vel_e{0.0f};
-
-    bool     _imu_ref_gps_accel_valid{false};
-    uint64_t _imu_ref_gps_accel_us{0};
-    float    _imu_ref_gps_accel_n{0.0f};
-    float    _imu_ref_gps_accel_e{0.0f};
-
-    static constexpr uint64_t IMU_REF_GPS_MAX_AGE_US = 800000ULL; // 800 ms
-    static constexpr double   IMU_REF_GPS_MIN_DT_S   = 0.05;
-    static constexpr double   IMU_REF_GPS_MAX_DT_S   = 2.0;
-    // Tolerancia fixa (nao adaptativa) entre a aceleracao horizontal da IMU e a do GPS.
-    static constexpr double   IMU_CROSSCHECK_RESIDUAL_MAX_MS2 = 4.0;
-
-    // ======== MITIGACAO IMU - SUBSTITUTO DINAMICO VIA VIO ========
-    // Accel/gyro reconstruidos a partir da odometria visual (VIO): a velocidade
-    // angular vem diretamente da mensagem de odometria, e a aceleracao vem da
-    // diferenca finita da velocidade VIO (NED), rotacionada para o corpo e com a
-    // gravidade subtraida. Recalculado a cada atualizacao de VIO.
-    bool     _vio_imu_gyro_valid{false};
-    uint64_t _vio_imu_gyro_us{0};
-    float    _vio_imu_gyro_body[3]{0.0f, 0.0f, 0.0f};
-
-    bool     _vio_imu_accel_valid{false};
-    uint64_t _vio_imu_accel_us{0};
-    float    _vio_imu_accel_body[3]{0.0f, 0.0f, -9.80665f};
-
-    // Idade maxima aceita para o substituto de VIO antes de ser considerado obsoleto.
-    static constexpr uint64_t IMU_VIO_SUBSTITUTE_MAX_AGE_US = 400000ULL; // 400 ms
-    // Piso de ruido somado ao substituto (desvio padrao). Um sensor real
-    // sempre tem algum ruido; sem isso, com o veiculo parado (ex.: pousado e
-    // desarmado, ataque ainda ativo), o substituto fica com valor exatamente
-    // constante entre amostras, o que o monitor de saude do PX4 interpreta
-    // como sensor travado ("STALE").
-    static constexpr float IMU_VIO_SUBSTITUTE_ACCEL_NOISE_STD = 0.02f; // m/s^2
-    static constexpr float IMU_VIO_SUBSTITUTE_GYRO_NOISE_STD  = 0.003f; // rad/s
+    // Pouso automatico mitigado por anomalia de IMU - movido para dentro de
+    // ImuMitigation (nao mais compartilhado via checkGenericAnomalyAutoLand/Disarm).
+    // bool     _imu_landing_active{false};
+    // bool     _imu_auto_land_sent{false};
+    // bool     _imu_auto_disarm_sent{false};
+    // uint64_t _imu_auto_land_arrival_us{0};
+    // uint64_t _imu_auto_land_last_arrived_us{0};
+    // double   _imu_land_hold_n_m{0.0};
+    // double   _imu_land_hold_e_m{0.0};
+    // uint32_t _imu_sim_agl_ground_count{0};
     // ======== MITIGACAO IMU - FIM ========
 
     // ======== MITIGACAO MOTOR - ESTADO ========
@@ -416,67 +341,54 @@ private:
     // usados apenas para exigir voo proximo do nivelado (ver
     // MAG_MAX_TILT_RAD), ja que a convencao de eixos do magnetometro simulado
     // nao e garantida como a mesma FRD usada por accel/gyro, entao nao
-    // arriscamos compensar inclinacao via rotacao 3D.
+    // arriscamos compensar inclinacao via rotacao 3D. Compartilhada com as
+    // mitigacoes de lidar front e lidar 2D, por isso continua aqui (nao foi
+    // movida para dentro de MagnetometerMitigation).
     bool     _vio_heading_valid{false};
     uint64_t _vio_heading_us{0};
     float    _vio_heading_rad{0.0f};
     float    _vio_roll_rad{0.0f};
     float    _vio_pitch_rad{0.0f};
     // Inclinacao maxima (rad) para confiar no heading calculado a partir do
-    // magnetometro sem compensacao de tilt.
+    // magnetometro sem compensacao de tilt. Duplicada dentro de
+    // MagnetometerMitigation (mesmo valor) e tambem usada por lidar front/2D.
     static constexpr float MAG_MAX_TILT_RAD = 0.20f; // ~11.5 graus
-
-    // Offset entre heading do magnetometro e heading da VIO. As primeiras
-    // MAG_BASELINE_WARMUP_SAMPLES amostras saudaveis calibram o offset com um
-    // alpha mais agressivo (MAG_BASELINE_WARMUP_ALPHA), evitando que uma
-    // unica amostra ruidosa logo no inicio do voo real (quando o veiculo
-    // tende a ter mais dinamica de atitude) defina a referencia sozinha.
-    // Depois do warmup, a deteccao passa a ficar ativa e o offset adapta
-    // lentamente (MAG_BASELINE_ALPHA), sem ser atualizado quando a amostra e
-    // anomala.
-    bool     _mag_baseline_initialized{false};
-    uint32_t _mag_baseline_warmup_count{0};
-    double   _mag_heading_offset_rad{0.0};
-    static constexpr uint32_t MAG_BASELINE_WARMUP_SAMPLES = 60;
-    static constexpr double   MAG_BASELINE_WARMUP_ALPHA   = 0.25;
-    static constexpr double MAG_BASELINE_ALPHA = 0.01;
-
-    bool     _mag_anomaly_active{false};
-    uint64_t _mag_anomaly_start_us{0};
-    uint64_t _mag_recovery_start_us{0};
-    // Limita quantas vezes o log periodico de status aparece por episodio de
-    // anomalia (a leitura do sensor via listener nao pode competir com log
-    // continuo no console).
-    uint32_t _mag_mitig_diag_count{0};
-    static constexpr uint32_t MAG_MITIG_DIAG_MAX_COUNT = 5;
-
-    // Faixa ampla de magnitude do campo horizontal em Gauss (unidade efetiva
-    // publicada em magnetometer_ga, apesar do nome do campo na mensagem de
-    // origem), usada como verificacao de plausibilidade adicional.
-    static constexpr double MAG_FIELD_HORIZ_MIN_G = 0.02;
-    static constexpr double MAG_FIELD_HORIZ_MAX_G = 1.0;
-    // Limiares de erro de heading (rad) entre magnetometro e VIO.
-    static constexpr double MAG_HEADING_ERROR_THRESHOLD_RAD = 0.35;   // ~20 graus
-    static constexpr double MAG_HEADING_ERROR_SEVERE_RAD    = 1.05;   // ~60 graus
-    static constexpr uint64_t MAG_ANOMALY_CONFIRM_US        = 3000000ULL; // 3 s
-    static constexpr uint64_t MAG_ANOMALY_CONFIRM_SEVERE_US = 20000ULL;  // 20 ms
-    static constexpr uint64_t MAG_RECOVERY_CONFIRM_US       = 500000ULL; // 500 ms
-    // Idade maxima aceita para a atitude da VIO usada como referencia. Precisa
-    // ser curta: durante guinada real (ex.: corrigindo rumo apos decolar),
-    // comparar uma leitura de magnetometro fresca contra uma atitude
-    // desatualizada cria um erro de heading artificial proporcional a taxa de
-    // guinada vezes o atraso.
+    // Idade maxima aceita para a atitude da VIO usada como referencia.
+    // Duplicada dentro de MagnetometerMitigation e tambem usada por lidar front/2D.
     static constexpr uint64_t MAG_VIO_MAX_AGE_US            = 100000ULL; // 100 ms
 
-    // Pouso automatico mitigado por anomalia de magnetometro.
-    bool     _mag_landing_active{false};
-    bool     _mag_auto_land_sent{false};
-    bool     _mag_auto_disarm_sent{false};
-    uint64_t _mag_auto_land_arrival_us{0};
-    uint64_t _mag_auto_land_last_arrived_us{0};
-    double   _mag_land_hold_n_m{0.0};
-    double   _mag_land_hold_e_m{0.0};
-    uint32_t _mag_sim_agl_ground_count{0};
+    // O restante do estado de deteccao/pouso de magnetometro foi movido para
+    // dentro de MagnetometerMitigation (ver checkAutoLand/checkAutoDisarm).
+    // bool     _mag_baseline_initialized{false};
+    // uint32_t _mag_baseline_warmup_count{0};
+    // double   _mag_heading_offset_rad{0.0};
+    // static constexpr uint32_t MAG_BASELINE_WARMUP_SAMPLES = 60;
+    // static constexpr double   MAG_BASELINE_WARMUP_ALPHA   = 0.25;
+    // static constexpr double MAG_BASELINE_ALPHA = 0.01;
+
+    // bool     _mag_anomaly_active{false};
+    // uint64_t _mag_anomaly_start_us{0};
+    // uint64_t _mag_recovery_start_us{0};
+    // uint32_t _mag_mitig_diag_count{0};
+    // static constexpr uint32_t MAG_MITIG_DIAG_MAX_COUNT = 5;
+
+    // static constexpr double MAG_FIELD_HORIZ_MIN_G = 0.02;
+    // static constexpr double MAG_FIELD_HORIZ_MAX_G = 1.0;
+    // static constexpr double MAG_HEADING_ERROR_THRESHOLD_RAD = 0.35;   // ~20 graus
+    // static constexpr double MAG_HEADING_ERROR_SEVERE_RAD    = 1.05;   // ~60 graus (nunca usada, ja era codigo morto)
+    // static constexpr uint64_t MAG_ANOMALY_CONFIRM_US        = 3000000ULL; // 3 s
+    // static constexpr uint64_t MAG_ANOMALY_CONFIRM_SEVERE_US = 20000ULL;  // 20 ms
+    // static constexpr uint64_t MAG_RECOVERY_CONFIRM_US       = 500000ULL; // 500 ms
+
+    // bool     _mag_landing_active{false};
+    // bool     _mag_auto_land_sent{false};
+    // bool     _mag_auto_disarm_sent{false};
+    // uint64_t _mag_auto_land_arrival_us{0};
+    // uint64_t _mag_auto_land_last_arrived_us{0};
+    // double   _mag_land_hold_n_m{0.0};
+    // double   _mag_land_hold_e_m{0.0};
+    // uint32_t _mag_sim_agl_ground_count{0};
+    MagnetometerMitigation _mag_mitigation;
     // ======== MITIGACAO MAGNETOMETRO - FIM ========
 
     // ======== MITIGACAO LIDAR - ESTADO ========

@@ -80,6 +80,10 @@ if (gz-transport_FOUND)
 			${PX4_SOURCE_DIR}/../attacks/MagnetometerAttack.hpp
 			${PX4_SOURCE_DIR}/../mitigations/GpsMitigation.cpp
 			${PX4_SOURCE_DIR}/../mitigations/GpsMitigation.hpp
+			${PX4_SOURCE_DIR}/../mitigations/ImuMitigation.cpp
+			${PX4_SOURCE_DIR}/../mitigations/ImuMitigation.hpp
+			${PX4_SOURCE_DIR}/../mitigations/MagnetometerMitigation.cpp
+			${PX4_SOURCE_DIR}/../mitigations/MagnetometerMitigation.hpp
 		DEPENDS
 			mixer_module
 			px4_work_queue

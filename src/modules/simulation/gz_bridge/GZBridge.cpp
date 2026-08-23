@@ -584,40 +584,9 @@ void GZBridge::attackMitigationCallback(const gz::msgs::Vector3d &msg)
     _lpos_heading_rad = 0.0f;
 
     // Reinicia o estado da mitigacao de IMU (deteccao, linha de base, pouso).
-    _imu_baseline_initialized = false;
-    _imu_accel_norm_ewma = 9.80665;
-    _imu_accel_norm_var_ewma = 1.0;
-    _imu_gyro_norm_ewma = 0.0;
-    _imu_gyro_norm_var_ewma = 0.02;
-    _imu_anomaly_active = false;
-    _imu_anomaly_start_us = 0;
-    _imu_recovery_start_us = 0;
-    _imu_ever_armed = false;
-    _imu_prev_armed = false;
-    _imu_land_settle_until_us = 0;
-
-    _imu_ref_gps_prev_valid = false;
-    _imu_ref_gps_prev_us = 0;
-    _imu_ref_gps_prev_vel_n = 0.0f;
-    _imu_ref_gps_prev_vel_e = 0.0f;
-    _imu_ref_gps_accel_valid = false;
-    _imu_ref_gps_accel_us = 0;
-    _imu_ref_gps_accel_n = 0.0f;
-    _imu_ref_gps_accel_e = 0.0f;
-
-    _vio_imu_gyro_valid = false;
-    _vio_imu_gyro_us = 0;
-    _vio_imu_accel_valid = false;
-    _vio_imu_accel_us = 0;
-
-    _imu_landing_active = false;
-    _imu_auto_land_sent = false;
-    _imu_auto_disarm_sent = false;
-    _imu_auto_land_arrival_us = 0;
-    _imu_auto_land_last_arrived_us = 0;
-    _imu_land_hold_n_m = 0.0;
-    _imu_land_hold_e_m = 0.0;
-    _imu_sim_agl_ground_count = 0;
+    // O pouso/desarme de IMU tambem esta dentro de _imu_mitigation.reset()
+    // agora, ja que deixou de ser compartilhado com o molde generico.
+    _imu_mitigation.reset();
 
     // Reinicia o estado de pouso/desarme da mitigacao de motor. A deteccao e
     // a correcao em si vivem em GZMixingInterfaceESC, avisadas via setMitigationEnabled.
@@ -633,21 +602,7 @@ void GZBridge::attackMitigationCallback(const gz::msgs::Vector3d &msg)
 
     // Reinicia o estado da mitigacao de magnetometro (deteccao, linha de
     // base, pouso).
-    _mag_baseline_initialized = false;
-    _mag_baseline_warmup_count = 0;
-    _mag_heading_offset_rad = 0.0;
-    _mag_anomaly_active = false;
-    _mag_anomaly_start_us = 0;
-    _mag_recovery_start_us = 0;
-    _mag_mitig_diag_count = 0;
-    _mag_landing_active = false;
-    _mag_auto_land_sent = false;
-    _mag_auto_disarm_sent = false;
-    _mag_auto_land_arrival_us = 0;
-    _mag_auto_land_last_arrived_us = 0;
-    _mag_land_hold_n_m = 0.0;
-    _mag_land_hold_e_m = 0.0;
-    _mag_sim_agl_ground_count = 0;
+    _mag_mitigation.reset();
 
     // Reinicia o estado da mitigacao de LiDAR (deteccao, ancora, pouso).
     _lidar_baseline_initialized = false;
@@ -800,178 +755,10 @@ void GZBridge::magnetometerCallback(const gz::msgs::Magnetometer &msg)
     _mag_attack.apply(raw_x, raw_y, raw_z, report.x, report.y, report.z);
 
     // ======== MITIGACAO MAGNETOMETRO - INICIO ========
-    // Deteccao de anomalia no sinal publicado do sensor, sem consultar
-    // _mag_attack_option:
-    //  (a) magnitude do campo horizontal fora de uma faixa fisica plausivel;
-    //  (b) heading implicito no magnetometro divergindo do heading da VIO
-    //      (referencia independente) em relacao a um offset calibrado a
-    //      partir das primeiras amostras saudaveis e adaptado lentamente depois.
-    // So confia no calculo de heading quando o veiculo esta proximo do
-    // nivelado (roll/pitch da VIO abaixo de MAG_MAX_TILT_RAD): a convencao de
-    // eixos do magnetometro simulado nao e garantida como a mesma FRD usada
-    // por accel/gyro, entao nao arriscamos compensar inclinacao via rotacao.
-    // Nao exige que o veiculo ja tenha armado/voado: o heading e valido
-    // (e ate mais facil de validar, ja que vio_near_level tende a ser
-    // verdadeiro parado no chao) mesmo antes da decolagem, e o ataque deve
-    // ser detectavel nesse estado.
-    if (_attack_mitigation_enabled) {
-
-        const double horiz_mag = sqrt(
-            static_cast<double>(report.x) * static_cast<double>(report.x) +
-            static_cast<double>(report.y) * static_cast<double>(report.y));
-
-        const bool horiz_out_of_bounds =
-            !PX4_ISFINITE(horiz_mag) ||
-            (horiz_mag < MAG_FIELD_HORIZ_MIN_G) ||
-            (horiz_mag > MAG_FIELD_HORIZ_MAX_G);
-
-        const bool vio_att_recent =
-            _vio_heading_valid &&
-            (timestamp >= _vio_heading_us) &&
-            ((timestamp - _vio_heading_us) <= MAG_VIO_MAX_AGE_US);
-
-        const bool vio_near_level =
-            vio_att_recent &&
-            (fabsf(_vio_roll_rad) < MAG_MAX_TILT_RAD) &&
-            (fabsf(_vio_pitch_rad) < MAG_MAX_TILT_RAD);
-
-        const bool heading_ref_valid = vio_near_level && (horiz_mag > 1e-9);
-
-        double mag_heading = 0.0;
-        double offset = 0.0;
-        double heading_residual = 0.0;
-        bool heading_anomaly = false;
-
-        if (heading_ref_valid) {
-            mag_heading = atan2(static_cast<double>(report.y), static_cast<double>(report.x));
-
-            // A relacao real entre o heading implicito no magnetometro e o
-            // heading da VIO e uma reflexao (mag_heading ~= -vio_heading + c),
-            // nao uma simples rotacao (mag_heading ~= vio_heading + c). Isso
-            // vem do mapeamento de eixos do magnetometro simulado, que tem
-            // determinante -1 (troca e inverte os dois eixos horizontais).
-            offset = atan2(sin(mag_heading + static_cast<double>(_vio_heading_rad)),
-                     cos(mag_heading + static_cast<double>(_vio_heading_rad)));
-
-            if (_mag_baseline_initialized) {
-                heading_residual = atan2(sin(offset - _mag_heading_offset_rad), cos(offset - _mag_heading_offset_rad));
-                heading_anomaly = fabs(heading_residual) > MAG_HEADING_ERROR_THRESHOLD_RAD;
-            }
-        }
-
-        const bool sample_anomalous = horiz_out_of_bounds || heading_anomaly;
-
-        // Severo (confirmacao rapida) somente para violacao fisica dura. Um
-        // desacordo de heading, por maior que seja, pode vir de interferencia
-        // magnetica transitoria durante manobra (curva com tracao diferencial
-        // entre motores), entao sempre passa pela janela de confirmacao longa
-        // (MAG_ANOMALY_CONFIRM_US) em vez do caminho rapido.
-        const bool sample_severe = horiz_out_of_bounds;
-
-        if (!sample_anomalous) {
-
-            // Atualiza a linha de base apenas com amostras saudaveis. As
-            // primeiras amostras (warmup) calibram o offset com um alpha mais
-            // agressivo, para nao travar numa unica amostra ruidosa logo no
-            // inicio do voo real; depois disso, adapta lentamente (tolera
-            // deriva legitima do sensor, mas um ataque sustentado nao chega a
-            // ser absorvido, pois so entra aqui quando a amostra nao e anomala).
-            if (heading_ref_valid) {
-                if (_mag_baseline_warmup_count == 0) {
-                    _mag_heading_offset_rad = offset;
-                    _mag_baseline_warmup_count = 1;
-
-                } else if (_mag_baseline_warmup_count < MAG_BASELINE_WARMUP_SAMPLES) {
-                    const double delta = atan2(sin(offset - _mag_heading_offset_rad), cos(offset - _mag_heading_offset_rad));
-                    _mag_heading_offset_rad = atan2(
-                        sin(_mag_heading_offset_rad + MAG_BASELINE_WARMUP_ALPHA * delta),
-                        cos(_mag_heading_offset_rad + MAG_BASELINE_WARMUP_ALPHA * delta));
-                    _mag_baseline_warmup_count++;
-
-                    if (_mag_baseline_warmup_count >= MAG_BASELINE_WARMUP_SAMPLES) {
-                        _mag_baseline_initialized = true;
-                    }
-
-                } else {
-                    const double delta = atan2(sin(offset - _mag_heading_offset_rad), cos(offset - _mag_heading_offset_rad));
-                    _mag_heading_offset_rad = atan2(
-                        sin(_mag_heading_offset_rad + MAG_BASELINE_ALPHA * delta),
-                        cos(_mag_heading_offset_rad + MAG_BASELINE_ALPHA * delta));
-                }
-            }
-
-            if (_mag_anomaly_active) {
-                if (_mag_recovery_start_us == 0) {
-                    _mag_recovery_start_us = timestamp;
-
-                } else if ((timestamp - _mag_recovery_start_us) >= MAG_RECOVERY_CONFIRM_US) {
-                    _mag_anomaly_active = false;
-                    _mag_anomaly_start_us = 0;
-                    _mag_mitig_diag_count = 0;
-
-                    PX4_INFO("\n[Mag-Mitig] Sensor anomaly cleared\n");
-                }
-            }
-
-        } else {
-            _mag_recovery_start_us = 0;
-
-            if (_mag_anomaly_start_us == 0) {
-                _mag_anomaly_start_us = timestamp;
-            }
-
-            const uint64_t mag_confirm_required_us =
-                sample_severe ? MAG_ANOMALY_CONFIRM_SEVERE_US : MAG_ANOMALY_CONFIRM_US;
-
-            if (!_mag_anomaly_active &&
-                    ((timestamp - _mag_anomaly_start_us) >= mag_confirm_required_us)) {
-                _mag_anomaly_active = true;
-
-                PX4_WARN("\n[Mag-Mitig] Sensor anomaly detected | heading_residual=%.1f deg | mag_heading=%.1f deg | vio_heading=%.1f deg | offset=%.1f deg | baseline=%.1f deg | bounds=%s\n",
-                    math::degrees(heading_residual),
-                    math::degrees(mag_heading),
-                    static_cast<double>(math::degrees(_vio_heading_rad)),
-                    math::degrees(offset),
-                    math::degrees(_mag_heading_offset_rad),
-                    horiz_out_of_bounds ? "out" : "ok");
-            }
-
-            // Reconstroi a direcao a partir do heading esperado (reflexao do
-            // heading da VIO mais o offset calibrado, mesmo modelo da
-            // deteccao), preservando a magnitude horizontal ainda confiavel
-            // do proprio sinal atacado. So roda quando a ultima referencia de
-            // heading valida foi calculada em voo nivelado (heading_ref_valid
-            // so fica true nessas condicoes).
-            if (_mag_anomaly_active && heading_ref_valid) {
-                const double expected_heading = atan2(
-                    sin(_mag_heading_offset_rad - static_cast<double>(_vio_heading_rad)),
-                    cos(_mag_heading_offset_rad - static_cast<double>(_vio_heading_rad)));
-
-                report.x = static_cast<float>(horiz_mag * cos(expected_heading));
-                report.y = static_cast<float>(horiz_mag * sin(expected_heading));
-            }
-
-            if (_mag_anomaly_active && (_mag_mitig_diag_count < MAG_MITIG_DIAG_MAX_COUNT)) {
-                static uint64_t mag_mitig_diag_last_us = 0;
-
-                if ((timestamp - mag_mitig_diag_last_us) > 1000000ULL) {
-                    mag_mitig_diag_last_us = timestamp;
-                    _mag_mitig_diag_count++;
-
-                    PX4_INFO("\n[Mag-Mitig] Status | heading_residual=%.1f deg | mag_heading=%.1f deg | vio_heading=%.1f deg | horiz_mag=%.2e G | vio_age=%.0f ms\n",
-                        math::degrees(heading_residual),
-                        math::degrees(mag_heading),
-                        static_cast<double>(math::degrees(_vio_heading_rad)),
-                        horiz_mag,
-                        _vio_heading_valid ? static_cast<double>(timestamp - _vio_heading_us) / 1000.0 : -1.0);
-
-                    if (_mag_mitig_diag_count == MAG_MITIG_DIAG_MAX_COUNT) {
-                        PX4_WARN("\n[Mag-Mitig] Check: listener vehicle_magnetometer\n");
-                    }
-                }
-            }
-        }
-    }
+    _mag_mitigation.detectAndCorrect(_attack_mitigation_enabled, timestamp,
+                     _vio_heading_valid, _vio_heading_us,
+                     _vio_heading_rad, _vio_roll_rad, _vio_pitch_rad,
+                     report.x, report.y);
     // ======== MITIGACAO MAGNETOMETRO - FIM ========
 
     _sensor_mag_pub.publish(report);
@@ -1291,16 +1078,8 @@ void GZBridge::imuCallback(const gz::msgs::IMU &msg)
     _imu_attack.apply(accel.x, accel.y, accel.z, gyro.x, gyro.y, gyro.z);
 
     // ======== MITIGACAO IMU - INICIO ========
-    // Deteccao de anomalia no sinal publicado do sensor (accel/gyro ja com o
-    // ataque aplicado, se houver). Combina tres verificacoes:
-    //  (1) Limites fisicos de forca especifica.
-    //  (2) Z-score contra uma linha de base (media do acelerometro fixa na
-    //      gravidade local; media/variancia do giroscopio adaptativas).
-    //  (3) Aceleracao horizontal medida pela IMU vs. aceleracao horizontal
-    //      estimada por diferenca finita da velocidade GPS.
-    
-    // A deteccao so roda depois que o veiculo esteve armado e voando (nao
-    // pousado) pela primeira vez desde que a mitigacao foi habilitada.
+    // Deteccao e substituicao de anomalia de IMU. As checagens de armado/pouso
+    // usam as mesmas subscricoes compartilhadas com outras mitigacoes.
     actuator_armed_s imu_actuator_armed{};
     const bool imu_armed_available = _actuator_armed_sub.copy(&imu_actuator_armed);
     const bool imu_vehicle_armed = imu_armed_available && imu_actuator_armed.armed;
@@ -1309,219 +1088,12 @@ void GZBridge::imuCallback(const gz::msgs::IMU &msg)
     const bool imu_land_detector_available = _vehicle_land_detected_sub.copy(&imu_land_detected);
     const bool imu_vehicle_not_landed = imu_land_detector_available && !imu_land_detected.landed;
 
-    if (imu_vehicle_armed && imu_vehicle_not_landed) {
-        _imu_ever_armed = true;
-    }
-
-    // Suspende a deteccao por uma janela curta na transicao de armado para
-    // desarmado: o corte do empuxo pode gerar uma leitura transitoria de
-    // forca especifica proxima de zero, fisicamente identica a uma IMU
-    // zerada, sem relacao com ataque.
-    if (!imu_vehicle_armed && _imu_prev_armed) {
-        _imu_land_settle_until_us = timestamp + IMU_LAND_SETTLE_US;
-    }
-
-    _imu_prev_armed = imu_vehicle_armed;
-
-    if (_attack_mitigation_enabled && _imu_ever_armed && (timestamp >= _imu_land_settle_until_us)) {
-
-        const double accel_x_d = static_cast<double>(accel.x);
-        const double accel_y_d = static_cast<double>(accel.y);
-        const double accel_z_d = static_cast<double>(accel.z);
-        const double gyro_x_d  = static_cast<double>(gyro.x);
-        const double gyro_y_d  = static_cast<double>(gyro.y);
-        const double gyro_z_d  = static_cast<double>(gyro.z);
-
-        const double accel_norm = sqrt(
-            accel_x_d * accel_x_d +
-            accel_y_d * accel_y_d +
-            accel_z_d * accel_z_d);
-
-        const double gyro_norm = sqrt(
-            gyro_x_d * gyro_x_d +
-            gyro_y_d * gyro_y_d +
-            gyro_z_d * gyro_z_d);
-
-        // (1) Limites fisicos de forca especifica.
-        const bool accel_out_of_bounds =
-            !PX4_ISFINITE(accel_norm) ||
-            (accel_norm < IMU_ACCEL_NORM_MIN_MS2) ||
-            (accel_norm > IMU_ACCEL_NORM_MAX_MS2);
-
-        // (2) Z-score contra a linha de base.
-        const double accel_std = sqrt(math::max(_imu_accel_norm_var_ewma, 1e-6));
-        const double accel_z = fabs(accel_norm - _imu_accel_norm_ewma) / accel_std;
-
-        double gyro_z = 0.0;
-
-        if (_imu_baseline_initialized) {
-            const double gyro_std = sqrt(math::max(_imu_gyro_norm_var_ewma, 1e-6));
-            gyro_z = fabs(gyro_norm - _imu_gyro_norm_ewma) / gyro_std;
-        }
-
-        const bool statistical_anomaly =
-            (accel_z > IMU_ZSCORE_THRESHOLD) ||
-            (_imu_baseline_initialized && (gyro_z > IMU_ZSCORE_THRESHOLD));
-
-        // (3) Aceleracao horizontal da IMU vs. aceleracao horizontal do GPS.
-        // So se aplica quando a referencia de GPS esta recente.
-        const bool gps_ref_recent =
-            _imu_ref_gps_accel_valid &&
-            (timestamp >= _imu_ref_gps_accel_us) &&
-            ((timestamp - _imu_ref_gps_accel_us) <= IMU_REF_GPS_MAX_AGE_US);
-
-        double gps_crosscheck_residual = 0.0;
-        bool gps_crosscheck_anomaly = false;
-
-        if (gps_ref_recent) {
-            const double accel_horiz = sqrt(accel_x_d * accel_x_d + accel_y_d * accel_y_d);
-
-            const double gps_accel_n_d = static_cast<double>(_imu_ref_gps_accel_n);
-            const double gps_accel_e_d = static_cast<double>(_imu_ref_gps_accel_e);
-            const double gps_horiz = sqrt(gps_accel_n_d * gps_accel_n_d + gps_accel_e_d * gps_accel_e_d);
-
-            gps_crosscheck_residual = fabs(accel_horiz - gps_horiz);
-            gps_crosscheck_anomaly = gps_crosscheck_residual > IMU_CROSSCHECK_RESIDUAL_MAX_MS2;
-        }
-
-        const bool sample_anomalous =
-            accel_out_of_bounds || statistical_anomaly || gps_crosscheck_anomaly;
-
-        // Anomalia severa: violacao fisica dura (limites/GPS) ou z-score acima
-        // de IMU_ZSCORE_SEVERE_THRESHOLD. Usa a janela de confirmacao reduzida.
-        const bool sample_severe =
-            accel_out_of_bounds ||
-            gps_crosscheck_anomaly ||
-            (accel_z > IMU_ZSCORE_SEVERE_THRESHOLD) ||
-            (_imu_baseline_initialized && (gyro_z > IMU_ZSCORE_SEVERE_THRESHOLD));
-
-        // Log periodico de diagnostico, apenas enquanto a anomalia esta ativa.
-        if (_imu_anomaly_active) {
-            static uint64_t imu_mitig_diag_last_us = 0;
-
-            if ((timestamp - imu_mitig_diag_last_us) > 1000000ULL) {
-                imu_mitig_diag_last_us = timestamp;
-
-                PX4_INFO("\n[IMU-Mitig] Status | accel_norm=%.2f (z=%.1f) gyro_norm=%.3f (z=%.1f) | "
-                    "gps_ref=%s residual=%.2f\n",
-                    accel_norm, accel_z, gyro_norm, gyro_z,
-                    gps_ref_recent ? "ok" : "stale",
-                    gps_crosscheck_residual);
-            }
-        }
-
-        if (!sample_anomalous) {
-
-            // Atualiza a linha de base com a amostra saudavel. A media do
-            // acelerometro permanece fixa; variancia do acelerometro e
-            // media/variancia do giroscopio se adaptam.
-            if (!_imu_baseline_initialized) {
-                _imu_gyro_norm_ewma  = gyro_norm;
-                _imu_accel_norm_var_ewma = 1.0;
-                _imu_gyro_norm_var_ewma  = 0.1;
-                _imu_baseline_initialized = true;
-
-            } else {
-                const double d_accel = accel_norm - _imu_accel_norm_ewma;
-                const double d_gyro  = gyro_norm - _imu_gyro_norm_ewma;
-
-                _imu_gyro_norm_ewma += IMU_BASELINE_ALPHA * d_gyro;
-
-                _imu_accel_norm_var_ewma =
-                    (1.0 - IMU_BASELINE_ALPHA) * _imu_accel_norm_var_ewma +
-                    IMU_BASELINE_ALPHA * d_accel * d_accel;
-
-                _imu_gyro_norm_var_ewma =
-                    (1.0 - IMU_BASELINE_ALPHA) * _imu_gyro_norm_var_ewma +
-                    IMU_BASELINE_ALPHA * d_gyro * d_gyro;
-
-                _imu_accel_norm_var_ewma = math::constrain(_imu_accel_norm_var_ewma, 0.05, 4.0);
-                _imu_gyro_norm_var_ewma  = math::constrain(_imu_gyro_norm_var_ewma, 0.02, 2.0);
-            }
-
-            if (_imu_anomaly_active) {
-                // Confirma recuperacao apos um intervalo estavel sem anomalia.
-                if (_imu_recovery_start_us == 0) {
-                    _imu_recovery_start_us = timestamp;
-
-                } else if ((timestamp - _imu_recovery_start_us) >= IMU_RECOVERY_CONFIRM_US) {
-                    _imu_anomaly_active = false;
-                    _imu_anomaly_start_us = 0;
-
-                    PX4_INFO("\n[IMU-Mitig] Sensor anomaly cleared | accel_norm=%.2f gyro_norm=%.3f\n",
-                        accel_norm, gyro_norm);
-                }
-            }
-
-        } else {
-
-            _imu_recovery_start_us = 0;
-
-            if (_imu_anomaly_start_us == 0) {
-                _imu_anomaly_start_us = timestamp;
-            }
-
-            const uint64_t confirm_required_us =
-                sample_severe ? IMU_ANOMALY_CONFIRM_SEVERE_US : IMU_ANOMALY_CONFIRM_US;
-
-            if (!_imu_anomaly_active &&
-                    ((timestamp - _imu_anomaly_start_us) >= confirm_required_us)) {
-                _imu_anomaly_active = true;
-
-                PX4_WARN("\n[IMU-Mitig] Sensor anomaly detected | accel_norm=%.2f (z=%.1f) gyro_norm=%.3f (z=%.1f) | "
-                    "bounds=%s gps_residual=%.2f (%s) | severe=%s confirm=%.0fms\n",
-                    accel_norm, accel_z, gyro_norm, gyro_z,
-                    accel_out_of_bounds ? "out" : "ok",
-                    gps_crosscheck_residual,
-                    gps_crosscheck_anomaly ? "anomalous" : (gps_ref_recent ? "ok" : "stale"),
-                    sample_severe ? "yes" : "no",
-                    static_cast<double>(confirm_required_us) / 1000.0);
-            }
-
-            // Substitui accel/gyro pelo substituto dinamico reconstruido a
-            // partir da VIO (ver bloco de reconstrucao em odometryCallback).
-            // Uma amostra severa (violacao fisica dura ou z-score muito acima
-            // do normal) e substituida imediatamente, mesmo antes da anomalia
-            // ser oficialmente confirmada: isso evita que qualquer amostra
-            // obviamente atacada chegue crua ao EKF do PX4 durante a janela
-            // de confirmacao. A confirmacao oficial (log/pouso) continua
-            // exigindo a janela de debounce normalmente.
-            if (_imu_anomaly_active || sample_severe) {
-                const bool vio_accel_recent =
-                    _vio_imu_accel_valid &&
-                    (timestamp >= _vio_imu_accel_us) &&
-                    ((timestamp - _vio_imu_accel_us) <= IMU_VIO_SUBSTITUTE_MAX_AGE_US);
-
-                const bool vio_gyro_recent =
-                    _vio_imu_gyro_valid &&
-                    (timestamp >= _vio_imu_gyro_us) &&
-                    ((timestamp - _vio_imu_gyro_us) <= IMU_VIO_SUBSTITUTE_MAX_AGE_US);
-
-                if (vio_accel_recent) {
-                    accel.x = _vio_imu_accel_body[0] + generate_wgn() * IMU_VIO_SUBSTITUTE_ACCEL_NOISE_STD;
-                    accel.y = _vio_imu_accel_body[1] + generate_wgn() * IMU_VIO_SUBSTITUTE_ACCEL_NOISE_STD;
-                    accel.z = _vio_imu_accel_body[2] + generate_wgn() * IMU_VIO_SUBSTITUTE_ACCEL_NOISE_STD;
-                }
-
-                if (vio_gyro_recent) {
-                    gyro.x = _vio_imu_gyro_body[0] + generate_wgn() * IMU_VIO_SUBSTITUTE_GYRO_NOISE_STD;
-                    gyro.y = _vio_imu_gyro_body[1] + generate_wgn() * IMU_VIO_SUBSTITUTE_GYRO_NOISE_STD;
-                    gyro.z = _vio_imu_gyro_body[2] + generate_wgn() * IMU_VIO_SUBSTITUTE_GYRO_NOISE_STD;
-                }
-
-                static uint64_t vio_substitute_log_last_us = 0;
-
-                if ((timestamp - vio_substitute_log_last_us) > 1000000ULL) {
-                    vio_substitute_log_last_us = timestamp;
-
-                    PX4_INFO("\n[IMU-Mitig] VIO substitute | accel=%s gyro=%s\n",
-                        vio_accel_recent ? "active" : "stale",
-                        vio_gyro_recent ? "active" : "stale");
-                }
-            }
-        }
-    }
+    _imu_mitigation.detectAndSubstitute(_attack_mitigation_enabled, timestamp,
+                        imu_vehicle_armed, imu_vehicle_not_landed,
+                        accel.x, accel.y, accel.z,
+                        gyro.x, gyro.y, gyro.z);
     // ======== MITIGACAO IMU - FIM ========
+
 
     _sensor_accel_pub.publish(accel);
     _sensor_gyro_pub.publish(gyro);
@@ -1753,8 +1325,15 @@ void GZBridge::imuCallback(const gz::msgs::IMU &msg)
     // ======== MITIGACAO DE POUSO GPS - FIM ========
 
     // ======== MITIGACAO DE POUSO IMU - INICIO ========
-    checkImuAutoLand(timestamp);
-    checkImuAutoDisarm(timestamp);
+    _imu_mitigation.checkAutoLand(timestamp, _pos_ref,
+                       _lpos_xy_valid, _lpos_timestamp,
+                       _lpos_n_m, _lpos_e_m, _lpos_ground_speed);
+
+    _imu_mitigation.checkAutoDisarm(timestamp,
+                       _ground_distance_valid, _ground_distance_timestamp, _ground_distance_m,
+                       _sim_agl_valid, _sim_agl_timestamp, _sim_agl_m,
+                       _sim_att_valid, _sim_att_timestamp, _sim_roll_rad, _sim_pitch_rad,
+                       _lpos_ground_speed);
     // ======== MITIGACAO DE POUSO IMU - FIM ========
 
     // ======== MITIGACAO DE POUSO MOTOR - INICIO ========
@@ -1763,8 +1342,15 @@ void GZBridge::imuCallback(const gz::msgs::IMU &msg)
     // ======== MITIGACAO DE POUSO MOTOR - FIM ========
 
     // ======== MITIGACAO DE POUSO MAGNETOMETRO - INICIO ========
-    checkMagAutoLand(timestamp);
-    checkMagAutoDisarm(timestamp);
+    _mag_mitigation.checkAutoLand(timestamp, _pos_ref,
+                       _lpos_xy_valid, _lpos_timestamp,
+                       _lpos_n_m, _lpos_e_m, _lpos_ground_speed);
+
+    _mag_mitigation.checkAutoDisarm(timestamp,
+                       _ground_distance_valid, _ground_distance_timestamp, _ground_distance_m,
+                       _sim_agl_valid, _sim_agl_timestamp, _sim_agl_m,
+                       _sim_att_valid, _sim_att_timestamp, _sim_roll_rad, _sim_pitch_rad,
+                       _lpos_ground_speed);
     // ======== MITIGACAO DE POUSO MAGNETOMETRO - FIM ========
 
     // ======== MITIGACAO DE POUSO LIDAR - INICIO ========
@@ -2056,18 +1642,20 @@ void GZBridge::publishGenericDisarmCommand(uint64_t timestamp, bool force_disarm
 // ======== MITIGACAO DE POUSO GENERICA - FIM ========
 
 // ======== MITIGACAO DE POUSO IMU - INICIO ========
-void GZBridge::checkImuAutoLand(uint64_t timestamp)
-{
-    checkGenericAnomalyAutoLand(timestamp, _imu_anomaly_active, _imu_landing_active,
-        _imu_auto_land_sent, _imu_auto_land_arrival_us, _imu_auto_land_last_arrived_us,
-        _imu_land_hold_n_m, _imu_land_hold_e_m, "IMU");
-}
+// Pouso de IMU deixou de usar o molde generico compartilhado - agora vive
+// inteiro dentro de ImuMitigation::checkAutoLand/checkAutoDisarm.
+// void GZBridge::checkImuAutoLand(uint64_t timestamp)
+// {
+    // checkGenericAnomalyAutoLand(timestamp, _imu_mitigation.isAnomalyActive(), _imu_landing_active,
+        // _imu_auto_land_sent, _imu_auto_land_arrival_us, _imu_auto_land_last_arrived_us,
+        // _imu_land_hold_n_m, _imu_land_hold_e_m, "IMU");
+// }
 
-void GZBridge::checkImuAutoDisarm(uint64_t timestamp)
-{
-    checkGenericAnomalyAutoDisarm(timestamp, _imu_landing_active, _imu_auto_land_sent,
-        _imu_auto_disarm_sent, _imu_sim_agl_ground_count, "IMU");
-}
+// void GZBridge::checkImuAutoDisarm(uint64_t timestamp)
+// {
+    // checkGenericAnomalyAutoDisarm(timestamp, _imu_landing_active, _imu_auto_land_sent,
+        // _imu_auto_disarm_sent, _imu_sim_agl_ground_count, "IMU");
+// }
 // ======== MITIGACAO DE POUSO IMU - FIM ========
 
 // ======== MITIGACAO DE POUSO MOTOR - INICIO ========
@@ -2086,18 +1674,20 @@ void GZBridge::checkMotorAutoDisarm(uint64_t timestamp)
 // ======== MITIGACAO DE POUSO MOTOR - FIM ========
 
 // ======== MITIGACAO DE POUSO MAGNETOMETRO - INICIO ========
-void GZBridge::checkMagAutoLand(uint64_t timestamp)
-{
-    checkGenericAnomalyAutoLand(timestamp, _mag_anomaly_active, _mag_landing_active,
-        _mag_auto_land_sent, _mag_auto_land_arrival_us, _mag_auto_land_last_arrived_us,
-        _mag_land_hold_n_m, _mag_land_hold_e_m, "Mag");
-}
+// Pouso de magnetometro deixou de usar o molde generico compartilhado -
+// agora vive inteiro dentro de MagnetometerMitigation::checkAutoLand/checkAutoDisarm.
+// void GZBridge::checkMagAutoLand(uint64_t timestamp)
+// {
+    // checkGenericAnomalyAutoLand(timestamp, _mag_anomaly_active, _mag_landing_active,
+        // _mag_auto_land_sent, _mag_auto_land_arrival_us, _mag_auto_land_last_arrived_us,
+        // _mag_land_hold_n_m, _mag_land_hold_e_m, "Mag");
+// }
 
-void GZBridge::checkMagAutoDisarm(uint64_t timestamp)
-{
-    checkGenericAnomalyAutoDisarm(timestamp, _mag_landing_active, _mag_auto_land_sent,
-        _mag_auto_disarm_sent, _mag_sim_agl_ground_count, "Mag");
-}
+// void GZBridge::checkMagAutoDisarm(uint64_t timestamp)
+// {
+    // checkGenericAnomalyAutoDisarm(timestamp, _mag_landing_active, _mag_auto_land_sent,
+        // _mag_auto_disarm_sent, _mag_sim_agl_ground_count, "Mag");
+// }
 // ======== MITIGACAO DE POUSO MAGNETOMETRO - FIM ========
 
 // ======== MITIGACAO DE POUSO LIDAR - INICIO ========
@@ -2397,7 +1987,8 @@ void GZBridge::odometryCallback(const gz::msgs::OdometryWithCovariance &msg)
 
     // ======== MITIGACAO IMU - INICIO ========
     // Reconstroi accel/gyro a partir da VIO (odometria visual), recalculado a
-    // cada atualizacao. Consumido em imuCallback quando uma anomalia esta ativa.
+    // cada atualizacao. Consumido por ImuMitigation::detectAndSubstitute()
+    // quando uma anomalia esta ativa.
     if (vio_sample_accepted) {
 
         // Aceleracao: aceleracao NED (por diferenca da velocidade VIO) menos a
@@ -2416,11 +2007,10 @@ void GZBridge::odometryCallback(const gz::msgs::OdometryWithCovariance &msg)
             if (PX4_ISFINITE(specific_force_body(0)) &&
                     PX4_ISFINITE(specific_force_body(1)) &&
                     PX4_ISFINITE(specific_force_body(2))) {
-                _vio_imu_accel_body[0] = specific_force_body(0);
-                _vio_imu_accel_body[1] = specific_force_body(1);
-                _vio_imu_accel_body[2] = specific_force_body(2);
-                _vio_imu_accel_valid = true;
-                _vio_imu_accel_us = timestamp;
+                _imu_mitigation.updateVioAccelSubstitute(timestamp,
+                                     specific_force_body(0),
+                                     specific_force_body(1),
+                                     specific_force_body(2));
             }
         }
 
@@ -2433,18 +2023,16 @@ void GZBridge::odometryCallback(const gz::msgs::OdometryWithCovariance &msg)
         const float vio_gyro_z = static_cast<float>(-msg.twist_with_covariance().twist().angular().z());
 
         if (PX4_ISFINITE(vio_gyro_x) && PX4_ISFINITE(vio_gyro_y) && PX4_ISFINITE(vio_gyro_z)) {
-            _vio_imu_gyro_body[0] = vio_gyro_x;
-            _vio_imu_gyro_body[1] = vio_gyro_y;
-            _vio_imu_gyro_body[2] = vio_gyro_z;
-            _vio_imu_gyro_valid = true;
-            _vio_imu_gyro_us = timestamp;
+            _imu_mitigation.updateVioGyroSubstitute(timestamp, vio_gyro_x, vio_gyro_y, vio_gyro_z);
         }
     }
     // ======== MITIGACAO IMU - FIM ========
 
     // ======== MITIGACAO MAGNETOMETRO - INICIO ========
     // Extrai heading, roll e pitch da atitude da propria VIO, referencia
-    // independente do magnetometro usada em magnetometerCallback.
+    // independente do magnetometro. Compartilhada com as mitigacoes de lidar
+    // front e lidar 2D - por isso continua aqui, nao dentro de
+    // MagnetometerMitigation.
     if (vio_sample_accepted) {
         const matrix::Quatf q_nb_att(q_nb.W(), q_nb.X(), q_nb.Y(), q_nb.Z());
         const matrix::Eulerf euler_vio{q_nb_att};
@@ -2762,29 +2350,8 @@ void GZBridge::navSatCallback(const gz::msgs::NavSat &msg)
 
         // ======== MITIGACAO IMU - INICIO ========
         // Aceleracao horizontal por diferenca finita da velocidade GPS, usada
-        // em imuCallback como referencia cruzada para o acelerometro.
-        if (_imu_ref_gps_prev_valid && (timestamp > _imu_ref_gps_prev_us)) {
-            const double dt_ref = static_cast<double>(timestamp - _imu_ref_gps_prev_us) * 1e-6;
-
-            if (dt_ref >= IMU_REF_GPS_MIN_DT_S && dt_ref <= IMU_REF_GPS_MAX_DT_S) {
-                const double accel_n_est =
-                    (static_cast<double>(vel_north) - static_cast<double>(_imu_ref_gps_prev_vel_n)) / dt_ref;
-                const double accel_e_est =
-                    (static_cast<double>(vel_east) - static_cast<double>(_imu_ref_gps_prev_vel_e)) / dt_ref;
-
-                if (PX4_ISFINITE(accel_n_est) && PX4_ISFINITE(accel_e_est)) {
-                    _imu_ref_gps_accel_n = static_cast<float>(accel_n_est);
-                    _imu_ref_gps_accel_e = static_cast<float>(accel_e_est);
-                    _imu_ref_gps_accel_valid = true;
-                    _imu_ref_gps_accel_us = timestamp;
-                }
-            }
-        }
-
-        _imu_ref_gps_prev_vel_n = vel_north;
-        _imu_ref_gps_prev_vel_e = vel_east;
-        _imu_ref_gps_prev_us = timestamp;
-        _imu_ref_gps_prev_valid = true;
+        // pela mitigacao de IMU como referencia cruzada para o acelerometro.
+        _imu_mitigation.updateGpsAccelReference(timestamp, vel_north, vel_east);
         // ======== MITIGACAO IMU - FIM ========
     }
     // ======== MITIGACAO BLACKOUT GPS - FIM ========
