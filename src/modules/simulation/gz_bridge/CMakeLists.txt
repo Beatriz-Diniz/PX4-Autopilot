@@ -84,6 +84,8 @@ if (gz-transport_FOUND)
 			${PX4_SOURCE_DIR}/../mitigations/ImuMitigation.hpp
 			${PX4_SOURCE_DIR}/../mitigations/MagnetometerMitigation.cpp
 			${PX4_SOURCE_DIR}/../mitigations/MagnetometerMitigation.hpp
+			${PX4_SOURCE_DIR}/../mitigations/LidarMitigation.cpp
+			${PX4_SOURCE_DIR}/../mitigations/LidarMitigation.hpp
 		DEPENDS
 			mixer_module
 			px4_work_queue
