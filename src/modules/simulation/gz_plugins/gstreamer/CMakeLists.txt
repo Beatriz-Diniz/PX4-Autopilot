@@ -45,6 +45,7 @@ else()
     add_library(${PROJECT_NAME} SHARED
         GstCameraSystem.cpp
         ${PX4_SOURCE_DIR}/../attacks/StreamAttack.cpp
+        ${PX4_SOURCE_DIR}/../mitigations/StreamMitigation.cpp
     )
 
     target_link_libraries(${PROJECT_NAME}
@@ -66,6 +67,7 @@ else()
         PUBLIC ${GSTREAMER_APP_INCLUDE_DIRS}
         PUBLIC ${OpenCV_INCLUDE_DIRS}
         PRIVATE ${PX4_SOURCE_DIR}/../attacks
+        PRIVATE ${PX4_SOURCE_DIR}/../mitigations
     )
 
     target_compile_options(${PROJECT_NAME}

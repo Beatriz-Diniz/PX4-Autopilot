@@ -91,109 +91,12 @@ bool GZMixingInterfaceESC::updateOutputs(uint16_t outputs[MAX_ACTUATORS], unsign
 		gz::msgs::Actuators rotor_velocity_message;
 		rotor_velocity_message.mutable_velocity()->Resize(active_output_count, 0);
 
-		// ====== INJEÇÃO DO ATAQUE DE MOTORES UAVISEC ======
+		// ====== INJEÇÃO DO ATAQUE DE MOTORES UAVJAMSIM ======
 		_motor_attack.apply(outputs, active_output_count);
 		// ==================================================
 
 		// ====== MITIGACAO MOTOR - INICIO ======
-		// Deteccao por implausibilidade fisica do comando prestes a ser
-		// enviado, sem consultar _motor_attack_option/_motor_attack_index:
-		//  (a) todos os motores comandados a empuxo proximo de zero enquanto
-		//      o veiculo esta armado e nao pousado;
-		//  (b) um motor com saida muito diferente da media dos demais,
-		//      quando a media indica empuxo relevante.
-		// (b) roda independente do estado de armado/pousado: um motor girando
-		// muito diferente dos demais e implausivel em qualquer estado, inclusive
-		// desarmado (o ataque nao respeita o estado de armado ao forcar o valor).
-		bool anomaly_this_cycle = false;
-
-		if (_motor_mitigation_enabled) {
-
-			float sum_outputs = 0.0f;
-
-			for (unsigned i = 0; i < active_output_count; i++) {
-				sum_outputs += static_cast<float>(outputs[i]);
-			}
-
-			const float mean_output = sum_outputs / static_cast<float>(active_output_count);
-			const bool all_near_zero = mean_output < MOTOR_MIN_ARMED_OUTPUT;
-
-			if (all_near_zero) {
-				actuator_armed_s armed{};
-				const bool armed_available = _actuator_armed_sub.copy(&armed);
-				const bool vehicle_armed = armed_available && armed.armed;
-
-				vehicle_land_detected_s land_detected{};
-				const bool land_detector_available = _vehicle_land_detected_sub.copy(&land_detected);
-				const bool vehicle_not_landed = land_detector_available && !land_detected.landed;
-
-				if (vehicle_armed && vehicle_not_landed) {
-					// Restaura o comando legitimo em todos os motores ativos.
-					for (unsigned i = 0; i < active_output_count; i++) {
-						outputs[i] = legitimate_outputs[i];
-					}
-
-					anomaly_this_cycle = true;
-				}
-
-			} else {
-				const float asymmetry_threshold = fmaxf(
-					MOTOR_ASYMMETRY_MIN_ABS,
-					mean_output * MOTOR_ASYMMETRY_FRACTION);
-
-				for (unsigned i = 0; i < active_output_count; i++) {
-					const float deviation = fabsf(static_cast<float>(outputs[i]) - mean_output);
-
-					if (deviation > asymmetry_threshold) {
-						outputs[i] = legitimate_outputs[i];
-						anomaly_this_cycle = true;
-					}
-				}
-
-				if (_motor_anomaly_active.load(std::memory_order_relaxed)) {
-					static uint64_t motor_mitig_diag_last_us = 0;
-					const uint64_t diag_now_us = hrt_absolute_time();
-
-					if ((diag_now_us - motor_mitig_diag_last_us) > 1000000ULL) {
-						motor_mitig_diag_last_us = diag_now_us;
-
-						PX4_INFO("\n[Motor-Mitig] Status | mean=%.1f threshold=%.1f\n",
-							static_cast<double>(mean_output),
-							static_cast<double>(asymmetry_threshold));
-					}
-				}
-			}
-		}
-
-		const uint64_t motor_mitig_timestamp = hrt_absolute_time();
-
-		if (anomaly_this_cycle) {
-			_motor_recovery_start_us = 0;
-
-			if (_motor_anomaly_start_us == 0) {
-				_motor_anomaly_start_us = motor_mitig_timestamp;
-			}
-
-			if (!_motor_anomaly_active.load(std::memory_order_relaxed) &&
-					((motor_mitig_timestamp - _motor_anomaly_start_us) >= MOTOR_ANOMALY_CONFIRM_US)) {
-				_motor_anomaly_active.store(true, std::memory_order_relaxed);
-				PX4_WARN("\n[Motor-Mitig] Actuator command anomaly detected and rejected\n");
-			}
-
-		} else {
-			_motor_anomaly_start_us = 0;
-
-			if (_motor_anomaly_active.load(std::memory_order_relaxed)) {
-				if (_motor_recovery_start_us == 0) {
-					_motor_recovery_start_us = motor_mitig_timestamp;
-
-				} else if ((motor_mitig_timestamp - _motor_recovery_start_us) >= MOTOR_RECOVERY_CONFIRM_US) {
-					_motor_anomaly_active.store(false, std::memory_order_relaxed);
-					_motor_recovery_start_us = 0;
-					PX4_INFO("\n[Motor-Mitig] Actuator command anomaly cleared\n");
-				}
-			}
-		}
+		_motor_mitigation.detectAndCorrect(outputs, legitimate_outputs, active_output_count);
 		// ====== MITIGACAO MOTOR - FIM ======
 
 		for (unsigned i = 0; i < active_output_count; i++) {

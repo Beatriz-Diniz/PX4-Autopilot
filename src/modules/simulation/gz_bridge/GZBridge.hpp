@@ -48,6 +48,8 @@
 #include "ImuMitigation.hpp"
 #include "LidarMitigation.hpp"
 #include "MagnetometerMitigation.hpp"
+#include "BarometerMitigation.hpp"
+#include "MotorMitigation.hpp"
 
 #include <px4_platform_common/atomic.h>
 #include <px4_platform_common/defines.h>
@@ -173,40 +175,40 @@ private:
     void opticalFlowCallback(const px4::msgs::OpticalFlow &msg);
     void magnetometerCallback(const gz::msgs::Magnetometer &msg);
 
-    // Molde comum de pouso/desarme para IMU, motor e magnetometro (cada uma
-    // com uma unica fonte de anomalia e uma unica fonte de posicao confiavel,
-    // diferente do GPS, que tem blackout e anomalia como origens distintas).
-    void checkGenericAnomalyAutoLand(
-        uint64_t timestamp,
-        bool anomaly_active,
-        bool &landing_active,
-        bool &auto_land_sent,
-        uint64_t &auto_land_arrival_us,
-        uint64_t &auto_land_last_arrived_us,
-        double &land_hold_n_m,
-        double &land_hold_e_m,
-        const char *log_tag);
-    void checkGenericAnomalyAutoDisarm(
-        uint64_t timestamp,
-        bool &landing_active,
-        bool &auto_land_sent,
-        bool &auto_disarm_sent,
-        uint32_t &sim_agl_ground_count,
-        const char *log_tag);
-    void publishGenericLandCommand(uint64_t timestamp, double land_hold_n_m, double land_hold_e_m, const char *log_tag);
-    void publishGenericDisarmCommand(uint64_t timestamp, bool force_disarm, const char *log_tag);
+    // Molde comum de pouso/desarme, usado ate motor ser o ultimo sensor a
+    // depender dele - agora cada sensor tem seu proprio pouso dedicado
+    // (ver *Mitigation::checkAutoLand/checkAutoDisarm).
+    // void checkGenericAnomalyAutoLand(
+        // uint64_t timestamp,
+        // bool anomaly_active,
+        // bool &landing_active,
+        // bool &auto_land_sent,
+        // uint64_t &auto_land_arrival_us,
+        // uint64_t &auto_land_last_arrived_us,
+        // double &land_hold_n_m,
+        // double &land_hold_e_m,
+        // const char *log_tag);
+    // void checkGenericAnomalyAutoDisarm(
+        // uint64_t timestamp,
+        // bool &landing_active,
+        // bool &auto_land_sent,
+        // bool &auto_disarm_sent,
+        // uint32_t &sim_agl_ground_count,
+        // const char *log_tag);
+    // void publishGenericLandCommand(uint64_t timestamp, double land_hold_n_m, double land_hold_e_m, const char *log_tag);
+    // void publishGenericDisarmCommand(uint64_t timestamp, bool force_disarm, const char *log_tag);
 
     // Pouso/desarme para a mitigacao de IMU: agora dedicado, dentro de
     // ImuMitigation (ver checkAutoLand/checkAutoDisarm em ImuMitigation.hpp).
     // void checkImuAutoLand(uint64_t timestamp);
     // void checkImuAutoDisarm(uint64_t timestamp);
 
-    // Pouso/desarme para a mitigacao de motor (wrapper sobre o molde generico).
-    // O gatilho vem da anomalia de atuacao detectada e ja corrigida em
-    // GZMixingInterfaceESC::updateOutputs (consultada via
-    // _mixing_interface_esc.motorAnomalyActive()).
-    void checkMotorAutoLand(uint64_t timestamp);
-    void checkMotorAutoDisarm(uint64_t timestamp);
+    // Pouso/desarme para a mitigacao de motor: agora dedicado, dentro de
+    // MotorMitigation (ver checkAutoLand/checkAutoDisarm). A deteccao
+    // tambem vive em MotorMitigation::detectAndCorrect, chamada a partir
+    // de GZMixingInterfaceESC::updateOutputs.
+    // void checkMotorAutoLand(uint64_t timestamp);
+    // void checkMotorAutoDisarm(uint64_t timestamp);
 
     // Pouso/desarme para a mitigacao de magnetometro: agora dedicado, dentro
     // de MagnetometerMitigation (ver checkAutoLand/checkAutoDisarm).
@@ -222,10 +224,10 @@ private:
     // void checkLidar2dAutoLand(uint64_t timestamp);
     // void checkLidar2dAutoDisarm(uint64_t timestamp);
 
-    // Pouso/desarme para a mitigacao de barometro (wrapper sobre o molde
-    // generico).
-    void checkBaroAutoLand(uint64_t timestamp);
-    void checkBaroAutoDisarm(uint64_t timestamp);
+    // Pouso/desarme para a mitigacao de barometro: dedicado, dentro de
+    // BarometerMitigation (ver checkAutoLand/checkAutoDisarm).
+    // void checkBaroAutoLand(uint64_t timestamp);
+    // void checkBaroAutoDisarm(uint64_t timestamp);
 
     static void rotateQuaternion(gz::math::Quaterniond &q_FRD_to_NED, const gz::math::Quaterniond q_FLU_to_ENU);
 
@@ -260,7 +262,7 @@ private:
     uORB::Subscription                            _vehicle_land_detected_sub{ORB_ID(vehicle_land_detected)};
     uORB::Subscription                            _actuator_armed_sub{ORB_ID(actuator_armed)};
 
-    GZMixingInterfaceESC   _mixing_interface_esc{_node};
+    GZMixingInterfaceESC   _mixing_interface_esc{_node, _motor_mitigation};
     GZMixingInterfaceServo _mixing_interface_servo{_node};
     GZMixingInterfaceWheel _mixing_interface_wheel{_node};
 
@@ -306,17 +308,18 @@ private:
     // ======== MITIGACAO IMU - FIM ========
 
     // ======== MITIGACAO MOTOR - ESTADO ========
-    // A deteccao e a correcao em tempo real do comando de motor acontecem em
-    // GZMixingInterfaceESC::updateOutputs (thread separada). Aqui so fica o
-    // estado do pouso/desarme, disparado ao consultar motorAnomalyActive().
-    bool     _motor_landing_active{false};
-    bool     _motor_auto_land_sent{false};
-    bool     _motor_auto_disarm_sent{false};
-    uint64_t _motor_auto_land_arrival_us{0};
-    uint64_t _motor_auto_land_last_arrived_us{0};
-    double   _motor_land_hold_n_m{0.0};
-    double   _motor_land_hold_e_m{0.0};
-    uint32_t _motor_sim_agl_ground_count{0};
+    // A deteccao e a correcao em tempo real do comando de motor continuam em
+    // GZMixingInterfaceESC::updateOutputs (thread separada). O pouso/desarme
+    // e proprio: ver MotorMitigation::checkAutoLand/checkAutoDisarm.
+    // bool     _motor_landing_active{false};
+    // bool     _motor_auto_land_sent{false};
+    // bool     _motor_auto_disarm_sent{false};
+    // uint64_t _motor_auto_land_arrival_us{0};
+    // uint64_t _motor_auto_land_last_arrived_us{0};
+    // double   _motor_land_hold_n_m{0.0};
+    // double   _motor_land_hold_e_m{0.0};
+    // uint32_t _motor_sim_agl_ground_count{0};
+    MotorMitigation _motor_mitigation;
     // ======== MITIGACAO MOTOR - FIM ========
 
     // ======== MITIGACAO MAGNETOMETRO - ESTADO ========
@@ -480,33 +483,33 @@ private:
     // comparacao por taxa de variacao nunca pegaria (o offset se cancela na
     // diferenca entre amostras): so uma comparacao por valor absoluto contra
     // essa ancora detecta.
-    bool     _baro_baseline_initialized{false};
-    uint32_t _baro_baseline_warmup_count{0};
-    double   _baro_anchor_offset_m{0.0}; // altitude_barometro - altitude_gps, na calibracao
-    static constexpr uint32_t BARO_BASELINE_WARMUP_SAMPLES = 30;
-    static constexpr double   BARO_BASELINE_WARMUP_ALPHA   = 0.25;
-    static constexpr double   BARO_BASELINE_ALPHA          = 0.01;
+    // bool     _baro_baseline_initialized{false};
+    // uint32_t _baro_baseline_warmup_count{0};
+    // double   _baro_anchor_offset_m{0.0};
+    // static constexpr uint32_t BARO_BASELINE_WARMUP_SAMPLES = 30;
+    // static constexpr double   BARO_BASELINE_WARMUP_ALPHA   = 0.25;
+    // static constexpr double   BARO_BASELINE_ALPHA          = 0.01;
 
-    bool     _baro_anomaly_active{false};
-    uint64_t _baro_anomaly_start_us{0};
-    uint64_t _baro_recovery_start_us{0};
-    uint32_t _baro_mitig_diag_count{0};
-    static constexpr uint32_t BARO_MITIG_DIAG_MAX_COUNT = 3;
+    // bool     _baro_anomaly_active{false};
+    // uint64_t _baro_anomaly_start_us{0};
+    // uint64_t _baro_recovery_start_us{0};
+    // uint32_t _baro_mitig_diag_count{0};
+    // static constexpr uint32_t BARO_MITIG_DIAG_MAX_COUNT = 3;
 
-    static constexpr double BARO_RESIDUAL_THRESHOLD_M = 3.0;
-    static constexpr uint64_t BARO_ANOMALY_CONFIRM_US  = 1500000ULL; // 1.5 s
-    static constexpr uint64_t BARO_RECOVERY_CONFIRM_US = 500000ULL;  // 500 ms
-    static constexpr uint64_t BARO_GPS_ALT_MAX_AGE_US  = 1000000ULL; // 1 s
+    // static constexpr double BARO_RESIDUAL_THRESHOLD_M = 3.0;
+    // static constexpr uint64_t BARO_ANOMALY_CONFIRM_US  = 1500000ULL; // 1.5 s
+    // static constexpr uint64_t BARO_RECOVERY_CONFIRM_US = 500000ULL;  // 500 ms
+    // static constexpr uint64_t BARO_GPS_ALT_MAX_AGE_US  = 1000000ULL; // 1 s
 
-    // Pouso automatico mitigado por anomalia de barometro.
-    bool     _baro_landing_active{false};
-    bool     _baro_auto_land_sent{false};
-    bool     _baro_auto_disarm_sent{false};
-    uint64_t _baro_auto_land_arrival_us{0};
-    uint64_t _baro_auto_land_last_arrived_us{0};
-    double   _baro_land_hold_n_m{0.0};
-    double   _baro_land_hold_e_m{0.0};
-    uint32_t _baro_sim_agl_ground_count{0};
+    // bool     _baro_landing_active{false};
+    // bool     _baro_auto_land_sent{false};
+    // bool     _baro_auto_disarm_sent{false};
+    // uint64_t _baro_auto_land_arrival_us{0};
+    // uint64_t _baro_auto_land_last_arrived_us{0};
+    // double   _baro_land_hold_n_m{0.0};
+    // double   _baro_land_hold_e_m{0.0};
+    // uint32_t _baro_sim_agl_ground_count{0};
+    BarometerMitigation _baro_mitigation;
     // ======== MITIGACAO BAROMETRO - FIM ========
 
     // Ataque de magnetometro

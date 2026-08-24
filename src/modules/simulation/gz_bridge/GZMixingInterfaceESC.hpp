@@ -39,14 +39,10 @@
 #include <gz/transport.hh>
 
 #include <uORB/PublicationMulti.hpp>
-#include <uORB/Subscription.hpp>
 #include <uORB/topics/esc_status.h>
-#include <uORB/topics/actuator_armed.h>
-#include <uORB/topics/vehicle_land_detected.h>
-
-#include <atomic>
 
 #include "MotorAttack.hpp"
+#include "MotorMitigation.hpp"
 
 
 // GZBridge mixing class for ESCs.
@@ -57,9 +53,10 @@ class GZMixingInterfaceESC : public OutputModuleInterface
 public:
 	static constexpr int MAX_ACTUATORS = MixingOutput::MAX_ACTUATORS;
 
-	GZMixingInterfaceESC(gz::transport::Node &node) :
+	GZMixingInterfaceESC(gz::transport::Node &node, MotorMitigation &motor_mitigation) :
 		OutputModuleInterface(MODULE_NAME "-actuators-esc", px4::wq_configurations::rate_ctrl),
-		_node(node)
+		_node(node),
+		_motor_mitigation(motor_mitigation)
 	{}
 
 	bool updateOutputs(uint16_t outputs[MAX_ACTUATORS], unsigned num_outputs, unsigned num_control_groups_updated) override;
@@ -74,31 +71,11 @@ public:
 		ScheduleClear();
 	}
 
-	// ====== ADIÇÃO UAVISEC ======
+	// ====== ADIÇÃO UAVJAMSIM ======
 	void setMotorAttack(int option, int index, double speed) {
-		// _motor_attack_option = option;
-		// _motor_attack_index = index;
-		// _motor_attack_speed = speed;
 		_motor_attack.set(option, index, speed);
 	}
 	// ============================
-
-	// ====== MITIGACAO MOTOR ======
-	// Habilita/desabilita a mitigacao. Chamado pelo GZBridge a partir do mesmo
-	// topico unico de mitigacao usado por GPS e IMU.
-	void setMitigationEnabled(bool enabled) {
-		_motor_mitigation_enabled = enabled;
-		_motor_anomaly_active.store(false);
-		_motor_anomaly_start_us = 0;
-		_motor_recovery_start_us = 0;
-	}
-
-	// Consultado pelo GZBridge (thread diferente) para acionar o pouso
-	// automatico quando uma anomalia de atuacao esta confirmada.
-	bool motorAnomalyActive() const {
-		return _motor_anomaly_active.load(std::memory_order_relaxed);
-	}
-	// ==============================
 
 private:
 	friend class GZBridge;
@@ -110,37 +87,8 @@ private:
 	gz::transport::Node &_node;
 	pthread_mutex_t _node_mutex;
 
-	// ====== VARIÁVEIS UAVISEC ======
-	// int _motor_attack_option{0};
-	// int _motor_attack_index{0};
-	// double _motor_attack_speed{0.0};
 	MotorAttack _motor_attack;
-	// ===============================
-
-	// ====== MITIGACAO MOTOR - ESTADO ======
-	bool _motor_mitigation_enabled{false};
-
-	uORB::Subscription _actuator_armed_sub{ORB_ID(actuator_armed)};
-	uORB::Subscription _vehicle_land_detected_sub{ORB_ID(vehicle_land_detected)};
-
-	// Lido pelo GZBridge em outra work queue/thread.
-	std::atomic<bool> _motor_anomaly_active{false};
-	uint64_t _motor_anomaly_start_us{0};
-	uint64_t _motor_recovery_start_us{0};
-
-	// Abaixo deste valor de saida (na mesma unidade de _motor_attack_speed,
-	// faixa 0-1450), o motor e considerado "sem empuxo relevante".
-	static constexpr float MOTOR_MIN_ARMED_OUTPUT = 50.0f;
-	// Desvio maximo tolerado entre a saida de um motor e a media dos demais,
-	// como fracao da propria media.
-	static constexpr float MOTOR_ASYMMETRY_FRACTION = 0.20f; // 20%
-	// Piso absoluto para a media nao gerar um limiar irrisorio perto do solo.
-	static constexpr float MOTOR_ASYMMETRY_MIN_ABS = 60.0f;
-	// Tempo minimo sustentado para confirmar a anomalia/recuperacao antes de
-	// sinalizar ao GZBridge (o bloqueio do comando em si e imediato, sem essa espera).
-	static constexpr uint64_t MOTOR_ANOMALY_CONFIRM_US = 100000ULL;  // 100 ms
-	static constexpr uint64_t MOTOR_RECOVERY_CONFIRM_US = 300000ULL; // 300 ms
-	// ========================================
+	MotorMitigation &_motor_mitigation;
 
 	MixingOutput _mixing_output{"SIM_GZ_EC", MAX_ACTUATORS, *this, MixingOutput::SchedulingPolicy::Auto, false, false};
 

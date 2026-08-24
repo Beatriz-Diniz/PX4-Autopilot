@@ -556,17 +556,10 @@ void GZBridge::attackMitigationCallback(const gz::msgs::Vector3d &msg)
     // Reinicia o estado da mitigacao de IMU (deteccao, linha de base, pouso).
     _imu_mitigation.reset();
 
-    // Reinicia o estado de pouso/desarme da mitigacao de motor. A deteccao e
-    // a correcao em si vivem em GZMixingInterfaceESC, avisadas via setMitigationEnabled.
-    _motor_landing_active = false;
-    _motor_auto_land_sent = false;
-    _motor_auto_disarm_sent = false;
-    _motor_auto_land_arrival_us = 0;
-    _motor_auto_land_last_arrived_us = 0;
-    _motor_land_hold_n_m = 0.0;
-    _motor_land_hold_e_m = 0.0;
-    _motor_sim_agl_ground_count = 0;
-    _mixing_interface_esc.setMitigationEnabled(_attack_mitigation_enabled);
+    // Reinicia o estado de pouso/desarme e de deteccao da mitigacao de motor
+    // (ambos agora em MotorMitigation).
+    _motor_mitigation.reset();
+    _motor_mitigation.setEnabled(_attack_mitigation_enabled);
 
     // Reinicia o estado da mitigacao de magnetometro (deteccao, linha de
     // base, pouso). O cache de atitude da VIO nao e resetado (ver
@@ -579,21 +572,7 @@ void GZBridge::attackMitigationCallback(const gz::msgs::Vector3d &msg)
     _lidar_mitigation.reset();
 
     // Reinicia o estado da mitigacao de barometro (deteccao, ancora, pouso).
-    _baro_baseline_initialized = false;
-    _baro_baseline_warmup_count = 0;
-    _baro_anchor_offset_m = 0.0;
-    _baro_anomaly_active = false;
-    _baro_anomaly_start_us = 0;
-    _baro_recovery_start_us = 0;
-    _baro_mitig_diag_count = 0;
-    _baro_landing_active = false;
-    _baro_auto_land_sent = false;
-    _baro_auto_disarm_sent = false;
-    _baro_auto_land_arrival_us = 0;
-    _baro_auto_land_last_arrived_us = 0;
-    _baro_land_hold_n_m = 0.0;
-    _baro_land_hold_e_m = 0.0;
-    _baro_sim_agl_ground_count = 0;
+    _baro_mitigation.reset();
 
     if (_attack_mitigation_enabled) {
         PX4_WARN("\n[Mitigation] KF-Jamming mitigation ENABLED\n");
@@ -709,142 +688,9 @@ void GZBridge::airPressureCallback(const gz::msgs::FluidPressure &msg)
     _baro_attack.apply(raw_pressure, raw_temperature, report.pressure, report.temperature);
 
     // ======== MITIGACAO BAROMETRO - INICIO ========
-    // Deteccao de anomalia na altitude implicita na pressao publicada, sem
-    // consultar _baro_attack_option: divergencia contra o valor esperado
-    // por uma ancora entre essa altitude e a altitude do GPS (referencia
-    // independente), calibrada a partir das primeiras amostras saudaveis.
-    // O ataque e um offset constante de altitude, que uma comparacao por
-    // taxa de variacao nunca pegaria (o offset se cancela na diferenca
-    // entre amostras): so uma comparacao por valor absoluto contra essa
-    // ancora detecta.
-    if (_attack_mitigation_enabled) {
-
-        constexpr float P0 = 101325.0f;
-        constexpr float T0 = 288.15f;
-        constexpr float L  = 0.0065f;
-        constexpr float EXP = 0.190263f;
-
-        const float P_published = report.pressure;
-        const bool pressure_valid =
-            PX4_ISFINITE(P_published) && P_published > 1000.0f && P_published < 120000.0f;
-
-        double baro_alt_from_report = NAN;
-
-        if (pressure_valid) {
-            baro_alt_from_report =
-                (static_cast<double>(T0) / static_cast<double>(L)) *
-                (1.0 - pow(static_cast<double>(P_published) / static_cast<double>(P0), static_cast<double>(EXP)));
-        }
-
-        const bool gps_alt_recent =
-            _gps_real_valid &&
-            (timestamp >= _gps_real_alt_timestamp) &&
-            ((timestamp - _gps_real_alt_timestamp) <= BARO_GPS_ALT_MAX_AGE_US) &&
-            PX4_ISFINITE(_gps_real_alt);
-
-        double residual = 0.0;
-        bool sample_anomalous = false;
-
-        if (gps_alt_recent && pressure_valid && _baro_baseline_initialized) {
-            const double expected_alt = _baro_anchor_offset_m + _gps_real_alt;
-            residual = baro_alt_from_report - expected_alt;
-            sample_anomalous = fabs(residual) > BARO_RESIDUAL_THRESHOLD_M;
-        }
-
-        if (!sample_anomalous) {
-
-            // Atualiza a ancora apenas com amostras saudaveis. As primeiras
-            // amostras (warmup) calibram com um alpha mais agressivo;
-            // depois, adapta lentamente (tolera deriva legitima, mas um
-            // ataque sustentado nao chega a ser absorvido, pois so entra
-            // aqui quando a amostra nao e anomala).
-            if (gps_alt_recent && pressure_valid) {
-                const double sample_offset = baro_alt_from_report - _gps_real_alt;
-
-                if (_baro_baseline_warmup_count == 0) {
-                    _baro_anchor_offset_m = sample_offset;
-                    _baro_baseline_warmup_count = 1;
-
-                } else if (_baro_baseline_warmup_count < BARO_BASELINE_WARMUP_SAMPLES) {
-                    _baro_anchor_offset_m += BARO_BASELINE_WARMUP_ALPHA * (sample_offset - _baro_anchor_offset_m);
-                    _baro_baseline_warmup_count++;
-
-                    if (_baro_baseline_warmup_count >= BARO_BASELINE_WARMUP_SAMPLES) {
-                        _baro_baseline_initialized = true;
-                    }
-
-                } else {
-                    _baro_anchor_offset_m += BARO_BASELINE_ALPHA * (sample_offset - _baro_anchor_offset_m);
-                }
-            }
-
-            if (_baro_anomaly_active) {
-                if (_baro_recovery_start_us == 0) {
-                    _baro_recovery_start_us = timestamp;
-
-                } else if ((timestamp - _baro_recovery_start_us) >= BARO_RECOVERY_CONFIRM_US) {
-                    _baro_anomaly_active = false;
-                    _baro_anomaly_start_us = 0;
-                    _baro_mitig_diag_count = 0;
-
-                    PX4_INFO("\n[Baro-Mitig] Sensor anomaly cleared\n");
-                }
-            }
-
-        } else {
-            _baro_recovery_start_us = 0;
-
-            if (_baro_anomaly_start_us == 0) {
-                _baro_anomaly_start_us = timestamp;
-            }
-
-            if (!_baro_anomaly_active &&
-                    ((timestamp - _baro_anomaly_start_us) >= BARO_ANOMALY_CONFIRM_US)) {
-                _baro_anomaly_active = true;
-
-                PX4_WARN("\n[Baro-Mitig] Sensor anomaly detected | alt=%.2f m | residual=%.2f m\n",
-                    baro_alt_from_report, residual);
-            }
-
-            // Reconstroi a pressao a partir da altitude esperada (ancora +
-            // altitude atual do GPS), usando o mesmo modelo de atmosfera
-            // padrao ja usado para calcular altitude a partir de pressao.
-            // A temperatura publicada nunca precisa ser reconstruida: vem
-            // de this->_temperature (airspeedCallback), caminho que o
-            // ataque de barometro nunca toca.
-            if (_baro_anomaly_active && gps_alt_recent && _baro_baseline_initialized) {
-                const double expected_alt = _baro_anchor_offset_m + _gps_real_alt;
-                const double corrected_pressure =
-                    static_cast<double>(P0) *
-                    pow(1.0 - (static_cast<double>(L) * expected_alt) / static_cast<double>(T0),
-                        1.0 / static_cast<double>(EXP));
-
-                if (PX4_ISFINITE(corrected_pressure) && corrected_pressure > 1000.0 && corrected_pressure < 120000.0) {
-                    report.pressure = static_cast<float>(corrected_pressure);
-                }
-
-                report.temperature = raw_temperature;
-            }
-
-            if (_baro_anomaly_active && (_baro_mitig_diag_count < BARO_MITIG_DIAG_MAX_COUNT)) {
-                static uint64_t baro_mitig_diag_last_us = 0;
-
-                if ((timestamp - baro_mitig_diag_last_us) > 1000000ULL) {
-                    baro_mitig_diag_last_us = timestamp;
-                    _baro_mitig_diag_count++;
-
-                    PX4_INFO("\n[Baro-Mitig] Status | pressure=%.1f Pa | residual=%.2f m | gps_alt=%s\n",
-                        static_cast<double>(report.pressure),
-                        residual,
-                        gps_alt_recent ? "ok" : "stale");
-
-                    if (_baro_mitig_diag_count == BARO_MITIG_DIAG_MAX_COUNT) {
-                        PX4_WARN("\n[Baro-Mitig] Check: listener sensor_baro\n");
-                    }
-                }
-            }
-        }
-    }
+    _baro_mitigation.detectAndCorrect(_attack_mitigation_enabled, timestamp,
+                     _gps_real_valid, _gps_real_alt_timestamp, _gps_real_alt,
+                     raw_temperature, report.pressure, report.temperature);
     // ======== MITIGACAO BAROMETRO - FIM ========
 
     _sensor_baro_pub.publish(report);
@@ -853,7 +699,7 @@ void GZBridge::airPressureCallback(const gz::msgs::FluidPressure &msg)
     // Cache usado pela mitigacao quando o barometro esta em estado
     // confiavel, decidido pela propria deteccao de anomalia do barometro
     // (sintoma), nao pela flag de comando do ataque.
-    if (!_baro_anomaly_active) {
+    if (!_baro_mitigation.isAnomalyActive()) {
         constexpr float P0 = 101325.0f;
         constexpr float T0 = 288.15f;
         constexpr float L  = 0.0065f;
@@ -1258,8 +1104,15 @@ void GZBridge::imuCallback(const gz::msgs::IMU &msg)
     // ======== MITIGACAO DE POUSO IMU - FIM ========
 
     // ======== MITIGACAO DE POUSO MOTOR - INICIO ========
-    checkMotorAutoLand(timestamp);
-    checkMotorAutoDisarm(timestamp);
+    _motor_mitigation.checkAutoLand(timestamp, _pos_ref, _motor_mitigation.isAnomalyActive(),
+                       _lpos_xy_valid, _lpos_timestamp,
+                       _lpos_n_m, _lpos_e_m, _lpos_ground_speed);
+
+    _motor_mitigation.checkAutoDisarm(timestamp,
+                       _ground_distance_valid, _ground_distance_timestamp, _ground_distance_m,
+                       _sim_agl_valid, _sim_agl_timestamp, _sim_agl_m,
+                       _sim_att_valid, _sim_att_timestamp, _sim_roll_rad, _sim_pitch_rad,
+                       _lpos_ground_speed);
     // ======== MITIGACAO DE POUSO MOTOR - FIM ========
 
     // ======== MITIGACAO DE POUSO MAGNETOMETRO - INICIO ========
@@ -1311,8 +1164,15 @@ void GZBridge::imuCallback(const gz::msgs::IMU &msg)
     // ======== MITIGACAO DE POUSO LIDAR 2D - FIM ========
 
     // ======== MITIGACAO DE POUSO BAROMETRO - INICIO ========
-    checkBaroAutoLand(timestamp);
-    checkBaroAutoDisarm(timestamp);
+    _baro_mitigation.checkAutoLand(timestamp, _pos_ref,
+                       _lpos_xy_valid, _lpos_timestamp,
+                       _lpos_n_m, _lpos_e_m, _lpos_ground_speed);
+
+    _baro_mitigation.checkAutoDisarm(timestamp,
+                       _ground_distance_valid, _ground_distance_timestamp, _ground_distance_m,
+                       _sim_agl_valid, _sim_agl_timestamp, _sim_agl_m,
+                       _sim_att_valid, _sim_att_timestamp, _sim_roll_rad, _sim_pitch_rad,
+                       _lpos_ground_speed);
     // ======== MITIGACAO DE POUSO BAROMETRO - FIM ========
 
 }
@@ -1323,264 +1183,264 @@ void GZBridge::imuCallback(const gz::msgs::IMU &msg)
 // cada uma dessas mitigacoes tem uma unica fonte de anomalia e uma unica
 // fonte de posicao confiavel (_lpos_*). GPS mantem implementacao propria por
 // ter duas origens distintas (blackout e anomalia por ruido).
-void GZBridge::checkGenericAnomalyAutoLand(
-    uint64_t timestamp,
-    bool anomaly_active,
-    bool &landing_active,
-    bool &auto_land_sent,
-    uint64_t &auto_land_arrival_us,
-    uint64_t &auto_land_last_arrived_us,
-    double &land_hold_n_m,
-    double &land_hold_e_m,
-    const char *log_tag)
-{
-    if (!_attack_mitigation_enabled || !anomaly_active ||
-            auto_land_sent || !_pos_ref.isInitialized()) {
-        auto_land_arrival_us = 0;
-        auto_land_last_arrived_us = 0;
-        return;
-    }
+// void GZBridge::checkGenericAnomalyAutoLand(
+    // uint64_t timestamp,
+    // bool anomaly_active,
+    // bool &landing_active,
+    // bool &auto_land_sent,
+    // uint64_t &auto_land_arrival_us,
+    // uint64_t &auto_land_last_arrived_us,
+    // double &land_hold_n_m,
+    // double &land_hold_e_m,
+    // const char *log_tag)
+// {
+    // if (!_attack_mitigation_enabled || !anomaly_active ||
+            // auto_land_sent || !_pos_ref.isInitialized()) {
+        // auto_land_arrival_us = 0;
+        // auto_land_last_arrived_us = 0;
+        // return;
+    // }
 
-    if (!_lpos_xy_valid || (timestamp - _lpos_timestamp) > 500000ULL) {
-        auto_land_arrival_us = 0;
-        auto_land_last_arrived_us = 0;
-        return;
-    }
+    // if (!_lpos_xy_valid || (timestamp - _lpos_timestamp) > 500000ULL) {
+        // auto_land_arrival_us = 0;
+        // auto_land_last_arrived_us = 0;
+        // return;
+    // }
 
-    position_setpoint_triplet_s triplet{};
+    // position_setpoint_triplet_s triplet{};
 
-    if (!_pos_sp_triplet_sub.copy(&triplet) || !triplet.current.valid ||
-            !PX4_ISFINITE(triplet.current.lat) || !PX4_ISFINITE(triplet.current.lon)) {
-        auto_land_arrival_us = 0;
-        auto_land_last_arrived_us = 0;
-        return;
-    }
+    // if (!_pos_sp_triplet_sub.copy(&triplet) || !triplet.current.valid ||
+            // !PX4_ISFINITE(triplet.current.lat) || !PX4_ISFINITE(triplet.current.lon)) {
+        // auto_land_arrival_us = 0;
+        // auto_land_last_arrived_us = 0;
+        // return;
+    // }
 
-    float dest_n_m = 0.0f;
-    float dest_e_m = 0.0f;
-    _pos_ref.project(triplet.current.lat, triplet.current.lon, dest_n_m, dest_e_m);
+    // float dest_n_m = 0.0f;
+    // float dest_e_m = 0.0f;
+    // _pos_ref.project(triplet.current.lat, triplet.current.lon, dest_n_m, dest_e_m);
 
-    const double dn = _lpos_n_m - static_cast<double>(dest_n_m);
-    const double de = _lpos_e_m - static_cast<double>(dest_e_m);
-    const float horizontal_error = static_cast<float>(sqrt(dn * dn + de * de));
+    // const double dn = _lpos_n_m - static_cast<double>(dest_n_m);
+    // const double de = _lpos_e_m - static_cast<double>(dest_e_m);
+    // const float horizontal_error = static_cast<float>(sqrt(dn * dn + de * de));
 
-    const bool arrived =
-        (horizontal_error <= AUTO_LAND_ANOMALY_DEST_RADIUS_M) &&
-        (_lpos_ground_speed <= AUTO_LAND_ANOMALY_MAX_SPEED_M_S);
+    // const bool arrived =
+        // (horizontal_error <= AUTO_LAND_ANOMALY_DEST_RADIUS_M) &&
+        // (_lpos_ground_speed <= AUTO_LAND_ANOMALY_MAX_SPEED_M_S);
 
-    if (!arrived) {
-        auto_land_arrival_us = 0;
-        auto_land_last_arrived_us = 0;
-        return;
-    }
+    // if (!arrived) {
+        // auto_land_arrival_us = 0;
+        // auto_land_last_arrived_us = 0;
+        // return;
+    // }
 
-    auto_land_last_arrived_us = timestamp;
+    // auto_land_last_arrived_us = timestamp;
 
-    if (auto_land_arrival_us == 0) {
-        auto_land_arrival_us = timestamp;
+    // if (auto_land_arrival_us == 0) {
+        // auto_land_arrival_us = timestamp;
 
-        land_hold_n_m = _lpos_n_m;
-        land_hold_e_m = _lpos_e_m;
+        // land_hold_n_m = _lpos_n_m;
+        // land_hold_e_m = _lpos_e_m;
 
-        PX4_INFO("\n[%s-Land] Destination reached | err_xy=%.1f m | vel=%.2f m/s | window=%.1f s\n",
-            log_tag,
-            static_cast<double>(horizontal_error),
-            static_cast<double>(_lpos_ground_speed),
-            static_cast<double>(AUTO_LAND_STABLE_US) / 1e6);
+        // PX4_INFO("\n[%s-Land] Destination reached | err_xy=%.1f m | vel=%.2f m/s | window=%.1f s\n",
+            // log_tag,
+            // static_cast<double>(horizontal_error),
+            // static_cast<double>(_lpos_ground_speed),
+            // static_cast<double>(AUTO_LAND_STABLE_US) / 1e6);
 
-        return;
-    }
+        // return;
+    // }
 
-    const uint64_t preland_elapsed_us = timestamp - auto_land_arrival_us;
+    // const uint64_t preland_elapsed_us = timestamp - auto_land_arrival_us;
 
-    if (preland_elapsed_us < AUTO_LAND_STABLE_US) {
-        return;
-    }
+    // if (preland_elapsed_us < AUTO_LAND_STABLE_US) {
+        // return;
+    // }
 
-    landing_active = true;
-    auto_land_sent = true;
+    // landing_active = true;
+    // auto_land_sent = true;
 
-    publishGenericLandCommand(timestamp, land_hold_n_m, land_hold_e_m, log_tag);
-}
+    // publishGenericLandCommand(timestamp, land_hold_n_m, land_hold_e_m, log_tag);
+// }
 
 // Envia comando de desarme assim que o detector de pouso do PX4 (ou, em ultimo
 // caso, os sensores de ground-truth do Gazebo usados apenas para confirmar o
 // solo) indicar contato com o solo. A anomalia original nunca e usada como
 // criterio aqui.
-void GZBridge::checkGenericAnomalyAutoDisarm(
-    uint64_t timestamp,
-    bool &landing_active,
-    bool &auto_land_sent,
-    bool &auto_disarm_sent,
-    uint32_t &sim_agl_ground_count,
-    const char *log_tag)
-{
-    if (!landing_active || !auto_land_sent || auto_disarm_sent) {
-        return;
-    }
+// void GZBridge::checkGenericAnomalyAutoDisarm(
+    // uint64_t timestamp,
+    // bool &landing_active,
+    // bool &auto_land_sent,
+    // bool &auto_disarm_sent,
+    // uint32_t &sim_agl_ground_count,
+    // const char *log_tag)
+// {
+    // if (!landing_active || !auto_land_sent || auto_disarm_sent) {
+        // return;
+    // }
 
-    vehicle_land_detected_s land_detected{};
-    const bool land_detector_available = _vehicle_land_detected_sub.copy(&land_detected);
+    // vehicle_land_detected_s land_detected{};
+    // const bool land_detector_available = _vehicle_land_detected_sub.copy(&land_detected);
 
-    const bool land_detector_recent =
-        land_detector_available &&
-        (land_detected.timestamp > 0) &&
-        (timestamp >= land_detected.timestamp) &&
-        ((timestamp - land_detected.timestamp) <= AUTO_LAND_GROUND_SENSOR_TIMEOUT_US);
+    // const bool land_detector_recent =
+        // land_detector_available &&
+        // (land_detected.timestamp > 0) &&
+        // (timestamp >= land_detected.timestamp) &&
+        // ((timestamp - land_detected.timestamp) <= AUTO_LAND_GROUND_SENSOR_TIMEOUT_US);
 
-    const bool ground_contact_by_px4_landed =
-        land_detector_recent && land_detected.landed;
+    // const bool ground_contact_by_px4_landed =
+        // land_detector_recent && land_detected.landed;
 
-    const bool ground_contact_by_px4_early =
-        land_detector_recent &&
-        (land_detected.ground_contact || land_detected.maybe_landed);
+    // const bool ground_contact_by_px4_early =
+        // land_detector_recent &&
+        // (land_detected.ground_contact || land_detected.maybe_landed);
 
-    const bool ground_sensor_recent =
-        _ground_distance_valid &&
-        ((timestamp - _ground_distance_timestamp) <= AUTO_LAND_GROUND_SENSOR_TIMEOUT_US);
+    // const bool ground_sensor_recent =
+        // _ground_distance_valid &&
+        // ((timestamp - _ground_distance_timestamp) <= AUTO_LAND_GROUND_SENSOR_TIMEOUT_US);
 
-    const bool ground_contact_by_sensor =
-        ground_sensor_recent &&
-        PX4_ISFINITE(_ground_distance_m) &&
-        (_ground_distance_m <= AUTO_LAND_GROUND_DISARM_DIST_M);
+    // const bool ground_contact_by_sensor =
+        // ground_sensor_recent &&
+        // PX4_ISFINITE(_ground_distance_m) &&
+        // (_ground_distance_m <= AUTO_LAND_GROUND_DISARM_DIST_M);
 
     // Ground-truth do Gazebo, usado exclusivamente para confirmar contato com
     // o solo durante o pouso, nunca para detectar a anomalia original.
-    const bool sim_ground_recent =
-        _sim_agl_valid &&
-        (timestamp >= _sim_agl_timestamp) &&
-        ((timestamp - _sim_agl_timestamp) <= AUTO_LAND_GROUND_SENSOR_TIMEOUT_US) &&
-        PX4_ISFINITE(_sim_agl_m);
+    // const bool sim_ground_recent =
+        // _sim_agl_valid &&
+        // (timestamp >= _sim_agl_timestamp) &&
+        // ((timestamp - _sim_agl_timestamp) <= AUTO_LAND_GROUND_SENSOR_TIMEOUT_US) &&
+        // PX4_ISFINITE(_sim_agl_m);
 
-    if (sim_ground_recent) {
-        if (_sim_agl_m <= AUTO_LAND_SIM_GROUND_DISARM_AGL_M) {
-            sim_agl_ground_count++;
-        } else {
-            sim_agl_ground_count = 0;
-        }
-    } else {
-        sim_agl_ground_count = 0;
-    }
+    // if (sim_ground_recent) {
+        // if (_sim_agl_m <= AUTO_LAND_SIM_GROUND_DISARM_AGL_M) {
+            // sim_agl_ground_count++;
+        // } else {
+            // sim_agl_ground_count = 0;
+        // }
+    // } else {
+        // sim_agl_ground_count = 0;
+    // }
 
-    const bool ground_contact_by_sim_agl =
-        sim_ground_recent &&
-        (_sim_agl_m <= AUTO_LAND_SIM_GROUND_DISARM_AGL_M) &&
-        (sim_agl_ground_count >= SIM_AGL_GROUND_CONFIRM_COUNT);
+    // const bool ground_contact_by_sim_agl =
+        // sim_ground_recent &&
+        // (_sim_agl_m <= AUTO_LAND_SIM_GROUND_DISARM_AGL_M) &&
+        // (sim_agl_ground_count >= SIM_AGL_GROUND_CONFIRM_COUNT);
 
-    if (!ground_contact_by_px4_landed &&
-            !ground_contact_by_px4_early &&
-            !ground_contact_by_sensor &&
-            !ground_contact_by_sim_agl) {
-        return;
-    }
+    // if (!ground_contact_by_px4_landed &&
+            // !ground_contact_by_px4_early &&
+            // !ground_contact_by_sensor &&
+            // !ground_contact_by_sim_agl) {
+        // return;
+    // }
 
-    const bool force_disarm = !ground_contact_by_px4_landed;
+    // const bool force_disarm = !ground_contact_by_px4_landed;
 
-    const bool disarm_att_recent =
-        _sim_att_valid &&
-        (timestamp >= _sim_att_timestamp) &&
-        ((timestamp - _sim_att_timestamp) <= 500000ULL);
+    // const bool disarm_att_recent =
+        // _sim_att_valid &&
+        // (timestamp >= _sim_att_timestamp) &&
+        // ((timestamp - _sim_att_timestamp) <= 500000ULL);
 
-    const bool forced_disarm_speed_ok = (_lpos_ground_speed <= 0.15f);
+    // const bool forced_disarm_speed_ok = (_lpos_ground_speed <= 0.15f);
 
-    const bool forced_disarm_att_ok =
-        !disarm_att_recent ||
-        ((fabsf(_sim_roll_rad) <= AUTO_LAND_MAX_ROLL_RAD) &&
-        (fabsf(_sim_pitch_rad) <= AUTO_LAND_MAX_PITCH_RAD));
+    // const bool forced_disarm_att_ok =
+        // !disarm_att_recent ||
+        // ((fabsf(_sim_roll_rad) <= AUTO_LAND_MAX_ROLL_RAD) &&
+        // (fabsf(_sim_pitch_rad) <= AUTO_LAND_MAX_PITCH_RAD));
 
-    if (force_disarm && (!forced_disarm_speed_ok || !forced_disarm_att_ok)) {
-        return;
-    }
+    // if (force_disarm && (!forced_disarm_speed_ok || !forced_disarm_att_ok)) {
+        // return;
+    // }
 
-    if (ground_contact_by_px4_landed) {
-        PX4_WARN("\n[%s-Land] PX4 landing detector confirmed landed - normal disarm\n", log_tag);
+    // if (ground_contact_by_px4_landed) {
+        // PX4_WARN("\n[%s-Land] PX4 landing detector confirmed landed - normal disarm\n", log_tag);
 
-    } else if (ground_contact_by_px4_early) {
-        PX4_WARN("\n[%s-Land] PX4 landing detector reported ground contact - safety disarm\n", log_tag);
+    // } else if (ground_contact_by_px4_early) {
+        // PX4_WARN("\n[%s-Land] PX4 landing detector reported ground contact - safety disarm\n", log_tag);
 
-    } else if (ground_contact_by_sensor) {
-        PX4_WARN("\n[%s-Land] Downward distance sensor reported ground contact | dist=%.2f m - safety disarm\n",
-            log_tag,
-            static_cast<double>(_ground_distance_m));
+    // } else if (ground_contact_by_sensor) {
+        // PX4_WARN("\n[%s-Land] Downward distance sensor reported ground contact | dist=%.2f m - safety disarm\n",
+            // log_tag,
+            // static_cast<double>(_ground_distance_m));
 
-    } else {
-        PX4_WARN("\n[%s-Land] Simulated ground proximity reached | agl=%.2f m - safety disarm\n",
-            log_tag,
-            static_cast<double>(_sim_agl_m));
-    }
+    // } else {
+        // PX4_WARN("\n[%s-Land] Simulated ground proximity reached | agl=%.2f m - safety disarm\n",
+            // log_tag,
+            // static_cast<double>(_sim_agl_m));
+    // }
 
-    publishGenericDisarmCommand(timestamp, force_disarm, log_tag);
-    auto_disarm_sent = true;
-    auto_land_sent = true;
-    landing_active = false;
-}
+    // publishGenericDisarmCommand(timestamp, force_disarm, log_tag);
+    // auto_disarm_sent = true;
+    // auto_land_sent = true;
+    // landing_active = false;
+// }
 
 // Envia LAND com coordenada global explicita no ponto de chegada (posicao
 // fixa; a descida vertical fica sob controle do modo LAND do PX4).
-void GZBridge::publishGenericLandCommand(uint64_t timestamp, double land_hold_n_m, double land_hold_e_m, const char *log_tag)
-{
-    double land_lat = 0.0;
-    double land_lon = 0.0;
-    _pos_ref.reproject(
-        static_cast<float>(land_hold_n_m),
-        static_cast<float>(land_hold_e_m),
-        land_lat,
-        land_lon);
+// void GZBridge::publishGenericLandCommand(uint64_t timestamp, double land_hold_n_m, double land_hold_e_m, const char *log_tag)
+// {
+    // double land_lat = 0.0;
+    // double land_lon = 0.0;
+    // _pos_ref.reproject(
+        // static_cast<float>(land_hold_n_m),
+        // static_cast<float>(land_hold_e_m),
+        // land_lat,
+        // land_lon);
 
-    vehicle_command_s cmd{};
-    cmd.timestamp = timestamp;
-    cmd.param1 = 0.0f;
-    cmd.param2 = 0.0f;
-    cmd.param3 = 0.0f;
-    cmd.param4 = NAN;
-    cmd.param5 = static_cast<float>(land_lat);
-    cmd.param6 = static_cast<float>(land_lon);
-    cmd.param7 = NAN;
+    // vehicle_command_s cmd{};
+    // cmd.timestamp = timestamp;
+    // cmd.param1 = 0.0f;
+    // cmd.param2 = 0.0f;
+    // cmd.param3 = 0.0f;
+    // cmd.param4 = NAN;
+    // cmd.param5 = static_cast<float>(land_lat);
+    // cmd.param6 = static_cast<float>(land_lon);
+    // cmd.param7 = NAN;
 
-    cmd.command = vehicle_command_s::VEHICLE_CMD_NAV_LAND;
-    cmd.target_system = 1;
-    cmd.target_component = 1;
-    cmd.source_system = 1;
-    cmd.source_component = 1;
-    cmd.confirmation = 0;
-    cmd.from_external = false;
+    // cmd.command = vehicle_command_s::VEHICLE_CMD_NAV_LAND;
+    // cmd.target_system = 1;
+    // cmd.target_component = 1;
+    // cmd.source_system = 1;
+    // cmd.source_component = 1;
+    // cmd.confirmation = 0;
+    // cmd.from_external = false;
 
-    _vehicle_command_pub.publish(cmd);
+    // _vehicle_command_pub.publish(cmd);
 
-    PX4_WARN("\n[%s-Land] Controlled landing started | hold N=%.1f E=%.1f | lat=%.7f lon=%.7f\n",
-        log_tag,
-        land_hold_n_m,
-        land_hold_e_m,
-        land_lat,
-        land_lon);
-}
+    // PX4_WARN("\n[%s-Land] Controlled landing started | hold N=%.1f E=%.1f | lat=%.7f lon=%.7f\n",
+        // log_tag,
+        // land_hold_n_m,
+        // land_hold_e_m,
+        // land_lat,
+        // land_lon);
+// }
 
 // Envia o comando de desarme do PX4 apos confirmacao de contato com o solo.
-void GZBridge::publishGenericDisarmCommand(uint64_t timestamp, bool force_disarm, const char *log_tag)
-{
-    vehicle_command_s cmd{};
-    cmd.timestamp = timestamp;
-    cmd.param1 = 0.0f;
-    cmd.param2 = force_disarm ? 21196.0f : 0.0f;
-    cmd.param3 = 0.0f;
-    cmd.param4 = 0.0f;
-    cmd.param5 = 0.0f;
-    cmd.param6 = 0.0f;
-    cmd.param7 = 0.0f;
-    cmd.command = vehicle_command_s::VEHICLE_CMD_COMPONENT_ARM_DISARM;
-    cmd.target_system = 1;
-    cmd.target_component = 1;
-    cmd.source_system = 1;
-    cmd.source_component = 1;
-    cmd.confirmation = 0;
-    cmd.from_external = false;
+// void GZBridge::publishGenericDisarmCommand(uint64_t timestamp, bool force_disarm, const char *log_tag)
+// {
+    // vehicle_command_s cmd{};
+    // cmd.timestamp = timestamp;
+    // cmd.param1 = 0.0f;
+    // cmd.param2 = force_disarm ? 21196.0f : 0.0f;
+    // cmd.param3 = 0.0f;
+    // cmd.param4 = 0.0f;
+    // cmd.param5 = 0.0f;
+    // cmd.param6 = 0.0f;
+    // cmd.param7 = 0.0f;
+    // cmd.command = vehicle_command_s::VEHICLE_CMD_COMPONENT_ARM_DISARM;
+    // cmd.target_system = 1;
+    // cmd.target_component = 1;
+    // cmd.source_system = 1;
+    // cmd.source_component = 1;
+    // cmd.confirmation = 0;
+    // cmd.from_external = false;
 
-    _vehicle_command_pub.publish(cmd);
+    // _vehicle_command_pub.publish(cmd);
 
-    PX4_WARN("\n[%s-Land] %s disarm command sent after ground contact confirmation.\n",
-        log_tag,
-        force_disarm ? "Forced" : "Normal");
-}
+    // PX4_WARN("\n[%s-Land] %s disarm command sent after ground contact confirmation.\n",
+        // log_tag,
+        // force_disarm ? "Forced" : "Normal");
+// }
 // ======== MITIGACAO DE POUSO GENERICA - FIM ========
 
 // ======== MITIGACAO DE POUSO IMU - INICIO ========
@@ -1600,18 +1460,18 @@ void GZBridge::publishGenericDisarmCommand(uint64_t timestamp, bool force_disarm
 // ======== MITIGACAO DE POUSO IMU - FIM ========
 
 // ======== MITIGACAO DE POUSO MOTOR - INICIO ========
-void GZBridge::checkMotorAutoLand(uint64_t timestamp)
-{
-    checkGenericAnomalyAutoLand(timestamp, _mixing_interface_esc.motorAnomalyActive(), _motor_landing_active,
-        _motor_auto_land_sent, _motor_auto_land_arrival_us, _motor_auto_land_last_arrived_us,
-        _motor_land_hold_n_m, _motor_land_hold_e_m, "Motor");
-}
+// void GZBridge::checkMotorAutoLand(uint64_t timestamp)
+// {
+    // checkGenericAnomalyAutoLand(timestamp, _mixing_interface_esc.motorAnomalyActive(), _motor_landing_active,
+        // _motor_auto_land_sent, _motor_auto_land_arrival_us, _motor_auto_land_last_arrived_us,
+        // _motor_land_hold_n_m, _motor_land_hold_e_m, "Motor");
+// }
 
-void GZBridge::checkMotorAutoDisarm(uint64_t timestamp)
-{
-    checkGenericAnomalyAutoDisarm(timestamp, _motor_landing_active, _motor_auto_land_sent,
-        _motor_auto_disarm_sent, _motor_sim_agl_ground_count, "Motor");
-}
+// void GZBridge::checkMotorAutoDisarm(uint64_t timestamp)
+// {
+    // checkGenericAnomalyAutoDisarm(timestamp, _motor_landing_active, _motor_auto_land_sent,
+        // _motor_auto_disarm_sent, _motor_sim_agl_ground_count, "Motor");
+// }
 // ======== MITIGACAO DE POUSO MOTOR - FIM ========
 
 // ======== MITIGACAO DE POUSO MAGNETOMETRO - INICIO ========
@@ -1678,18 +1538,19 @@ void GZBridge::checkMotorAutoDisarm(uint64_t timestamp)
 // ======== MITIGACAO DE POUSO LIDAR 2D - FIM ========
 
 // ======== MITIGACAO DE POUSO BAROMETRO - INICIO ========
-void GZBridge::checkBaroAutoLand(uint64_t timestamp)
-{
-    checkGenericAnomalyAutoLand(timestamp, _baro_anomaly_active, _baro_landing_active,
-        _baro_auto_land_sent, _baro_auto_land_arrival_us, _baro_auto_land_last_arrived_us,
-        _baro_land_hold_n_m, _baro_land_hold_e_m, "Baro");
-}
+// Pouso proprio de barometro: ver BarometerMitigation::checkAutoLand/checkAutoDisarm.
+// void GZBridge::checkBaroAutoLand(uint64_t timestamp)
+// {
+    // checkGenericAnomalyAutoLand(timestamp, _baro_anomaly_active, _baro_landing_active,
+        // _baro_auto_land_sent, _baro_auto_land_arrival_us, _baro_auto_land_last_arrived_us,
+        // _baro_land_hold_n_m, _baro_land_hold_e_m, "Baro");
+// }
 
-void GZBridge::checkBaroAutoDisarm(uint64_t timestamp)
-{
-    checkGenericAnomalyAutoDisarm(timestamp, _baro_landing_active, _baro_auto_land_sent,
-        _baro_auto_disarm_sent, _baro_sim_agl_ground_count, "Baro");
-}
+// void GZBridge::checkBaroAutoDisarm(uint64_t timestamp)
+// {
+    // checkGenericAnomalyAutoDisarm(timestamp, _baro_landing_active, _baro_auto_land_sent,
+        // _baro_auto_disarm_sent, _baro_sim_agl_ground_count, "Baro");
+// }
 // ======== MITIGACAO DE POUSO BAROMETRO - FIM ========
 
 
