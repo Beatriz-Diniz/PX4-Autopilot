@@ -693,6 +693,9 @@ void GZBridge::airPressureCallback(const gz::msgs::FluidPressure &msg)
                      raw_temperature, report.pressure, report.temperature);
     // ======== MITIGACAO BAROMETRO - FIM ========
 
+    // Converte Kelvin para Celsius antes da publicacao no PX4.
+    report.temperature -= 273.15f;
+
     _sensor_baro_pub.publish(report);
 
     // ======== MITIGACAO GPS - INICIO ========
